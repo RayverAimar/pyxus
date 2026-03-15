@@ -1,0 +1,1 @@
+"""FastAPI framework plugin (future)."""
