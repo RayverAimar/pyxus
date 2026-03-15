@@ -803,9 +803,10 @@ class _CallResolver:
     def _classify_unresolved(self, site: _CallSite) -> CallReason:
         """Classify an unresolved call as external or internal.
 
-        For dotted calls (obj.method), checks whether the OBJECT resolves to
-        a repo class via the AG. A method name existing somewhere in the repo
-        is not sufficient — "close" exists in both repo classes and stdlib.
+        Uses the same step-by-step AG resolution as _resolve_callee to
+        determine if the object is a repo class. Without this, calls like
+        self._command.execute() are misclassified as external because the
+        direct AG key "{caller_ns}.self._command" has no edges.
         """
         callee = site.callee_name
 
@@ -813,13 +814,45 @@ class _CallResolver:
             return CallReason.UNRESOLVED_INTERNAL if callee in self._symbol_index else CallReason.EXTERNAL
 
         obj_name, _ = callee.rsplit(".", 1)
-        obj_ns = f"{site.caller_ns}.{obj_name}"
 
-        for pointee in self._ag.get_pointees(obj_ns):
-            if pointee in self._id_to_info:
-                return CallReason.UNRESOLVED_INTERNAL
+        # super() is always internal
+        if obj_name == "super":
+            return CallReason.UNRESOLVED_INTERNAL
+
+        if self._object_resolves_to_repo(site.caller_ns, obj_name):
+            return CallReason.UNRESOLVED_INTERNAL
 
         return CallReason.EXTERNAL
+
+    def _object_resolves_to_repo(self, caller_ns: str, obj_name: str) -> bool:
+        """Check if an object name resolves to a repo symbol via the AG."""
+        obj_ns = f"{caller_ns}.{obj_name}"
+
+        # Direct AG check (works for simple variables like my_obj)
+        for pointee in self._ag.get_pointees(obj_ns):
+            if pointee in self._id_to_info:
+                return True
+
+        # Step-by-step for dotted objects (self.attr, self.attr.sub)
+        if "." in obj_name:
+            parts = obj_name.split(".")
+            current_ns = f"{caller_ns}.{parts[0]}"
+            for part in parts[1:]:
+                found_class = False
+                for pointee in self._ag.get_pointees(current_ns):
+                    info = self._id_to_info.get(pointee)
+                    if info and info[0] == SymbolKind.CLASS:
+                        current_ns = f"{pointee}.{part}"
+                        found_class = True
+                        break
+                if not found_class:
+                    return False
+            # Final attribute — check if it resolves to a repo symbol
+            for pointee in self._ag.get_pointees(current_ns):
+                if pointee in self._id_to_info:
+                    return True
+
+        return False
 
     def _find_enclosing_symbol(self, namespace: str) -> str | None:
         """Find the symbol ID of the function/method that contains a given namespace."""

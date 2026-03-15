@@ -317,6 +317,32 @@ class TestCoverageStats:
         assert len(result.unresolved) >= 1
         assert result.unresolved[0].reason == CallReason.UNRESOLVED_INTERNAL
 
+    def test_self_attr_method_classified_as_internal(self):
+        """self._command.execute() where _command is a stored repo object
+        should be classified as internal, not external."""
+        code = (
+            "class Command:\n"
+            "    def execute(self): pass\n"
+            "\n"
+            "class Invoker:\n"
+            "    def __init__(self):\n"
+            "        self._command = Command()\n"
+            "    def run(self):\n"
+            "        self._command.execute()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        # _command resolves to Command via AG → execute should resolve
+        targets = _extract_resolved_names(result)
+        assert "execute" in targets
+
+    def test_super_classified_as_internal(self):
+        """super().__init__() that can't resolve should be unresolved_internal, not external."""
+        code = "class Child(UnknownBase):\n    def __init__(self):\n        super().__init__()\n"
+        result = _make_call_resolution({"test.py": code})
+        # super().__init__() → internal (super() itself is a builtin → external)
+        assert len(result.unresolved) >= 1
+        assert result.unresolved[0].reason == CallReason.UNRESOLVED_INTERNAL
+
 
 class TestReturnTypePropagation:
     def test_return_value_tracked(self):
