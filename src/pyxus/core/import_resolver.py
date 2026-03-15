@@ -18,6 +18,7 @@ from pathlib import PurePosixPath
 
 from pyxus.core.file_walker import SourceFile
 from pyxus.graph.models import (
+    ImportScope,
     RelationKind,
     Relationship,
     SymbolKind,
@@ -29,6 +30,15 @@ logger = logging.getLogger("pyxus")
 
 
 @dataclass
+class ImportLocation:
+    """Where an import appears in the source file."""
+
+    line: int
+    scope: ImportScope
+    function: str | None = None  # enclosing function name if scope is "local"
+
+
+@dataclass
 class ResolvedImport:
     """An import statement that has been resolved to a file in the repository.
 
@@ -37,12 +47,14 @@ class ResolvedImport:
         target_file: The resolved file path (relative to repo root).
         imported_names: The specific names imported (empty for ``import module``).
         is_relative: Whether the import used relative syntax (dots).
+        location: Where the import appears (top-level vs local/deferred).
     """
 
     source_file: str
     target_file: str
     imported_names: list[str]
     is_relative: bool
+    location: ImportLocation | None = None
 
 
 @dataclass
@@ -112,53 +124,50 @@ def resolve_imports(
 
     resolved: list[ResolvedImport] = []
     unresolved: list[str] = []
-    relationships: list[Relationship] = []
-    seen_targets: set[str] = set()  # Avoid duplicate IMPORTS edges to the same file
+    seen_targets: dict[str, list[dict]] = {}  # target → list of location metadata
+    func_ranges = _build_function_ranges(tree)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 target = _resolve_absolute(alias.name, file_index)
                 if target:
+                    location = _make_location(node, func_ranges)
                     resolved.append(
                         ResolvedImport(
                             source_file=source_file.path,
                             target_file=target,
                             imported_names=[],
                             is_relative=False,
+                            location=location,
                         )
                     )
-                    if target not in seen_targets:
-                        seen_targets.add(target)
-                        relationships.append(_make_import_rel(source_file.path, target))
-                # External packages are silently ignored
+                    _track_target(seen_targets, target, location)
 
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             names = [alias.name for alias in node.names]
             level = node.level  # Number of dots (0 = absolute)
+            location = _make_location(node, func_ranges)
 
             if level > 0:
-                # Relative import
                 target = _resolve_relative(source_file.path, module, level, file_index)
             else:
-                # Absolute import
                 target = _resolve_absolute(module, file_index)
                 if target is None:
-                    # Try module.name for each imported name (e.g., from pkg import module)
                     for name in names:
                         sub_target = _resolve_absolute(f"{module}.{name}", file_index)
-                        if sub_target and sub_target not in seen_targets:
-                            seen_targets.add(sub_target)
+                        if sub_target:
                             resolved.append(
                                 ResolvedImport(
                                     source_file=source_file.path,
                                     target_file=sub_target,
                                     imported_names=[name],
                                     is_relative=False,
+                                    location=location,
                                 )
                             )
-                            relationships.append(_make_import_rel(source_file.path, sub_target))
+                            _track_target(seen_targets, sub_target, location)
                     continue
 
             if target:
@@ -168,16 +177,19 @@ def resolve_imports(
                         target_file=target,
                         imported_names=names,
                         is_relative=level > 0,
+                        location=location,
                     )
                 )
-                if target not in seen_targets:
-                    seen_targets.add(target)
-                    relationships.append(_make_import_rel(source_file.path, target))
+                _track_target(seen_targets, target, location)
             elif level > 0:
-                # Relative import that didn't resolve is likely a bug
                 import_str = f"{'.' * level}{module}"
                 unresolved.append(f"{source_file.path}: from {import_str} import {', '.join(names)}")
                 logger.debug("Unresolved relative import in %s: %s", source_file.path, import_str)
+
+    # Build one IMPORTS relationship per unique target, with location metadata
+    relationships = [
+        _make_import_rel(source_file.path, target, locations) for target, locations in seen_targets.items()
+    ]
 
     return ImportResolutionResult(
         resolved=resolved,
@@ -226,13 +238,52 @@ def _resolve_relative(
     return file_index.get(target_module)
 
 
-def _make_import_rel(source_path: str, target_path: str) -> Relationship:
-    """Create an IMPORTS relationship between two file module symbols."""
+def _build_function_ranges(tree: ast.Module) -> dict[int, str]:
+    """Map line numbers to their enclosing function name.
+
+    Returns a dict where each line inside a function body maps to the
+    function's name. Lines at module level are not included.
+    """
+    ranges: dict[int, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.end_lineno:
+            for line in range(node.lineno, node.end_lineno + 1):
+                ranges[line] = node.name
+    return ranges
+
+
+def _make_location(node: ast.AST, func_ranges: dict[int, str]) -> ImportLocation:
+    """Determine whether an import node is top-level or local."""
+    func_name = func_ranges.get(node.lineno)
+    if func_name:
+        return ImportLocation(line=node.lineno, scope=ImportScope.LOCAL, function=func_name)
+    return ImportLocation(line=node.lineno, scope=ImportScope.TOP_LEVEL)
+
+
+def _track_target(
+    seen_targets: dict[str, list[dict]],
+    target: str,
+    location: ImportLocation,
+) -> None:
+    """Accumulate import locations for each unique target file."""
+    loc_dict = {"line": location.line, "scope": location.scope}
+    if location.function:
+        loc_dict["function"] = location.function
+    if target not in seen_targets:
+        seen_targets[target] = []
+    seen_targets[target].append(loc_dict)
+
+
+def _make_import_rel(source_path: str, target_path: str, locations: list[dict]) -> Relationship:
+    """Create an IMPORTS relationship with location metadata."""
     source_id = make_symbol_id(SymbolKind.MODULE, source_path, source_path, 0)
     target_id = make_symbol_id(SymbolKind.MODULE, target_path, target_path, 0)
+    has_local = any(loc["scope"] == ImportScope.LOCAL for loc in locations)
+    has_top_level = any(loc["scope"] == ImportScope.TOP_LEVEL for loc in locations)
     return Relationship(
         id=make_relationship_id(source_id, target_id, RelationKind.IMPORTS),
         source_id=source_id,
         target_id=target_id,
         kind=RelationKind.IMPORTS,
+        metadata={"locations": locations, "has_local": has_local, "has_top_level": has_top_level},
     )

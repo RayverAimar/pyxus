@@ -5,7 +5,7 @@ from pyxus.core.import_resolver import (
     build_file_index,
     resolve_imports,
 )
-from pyxus.graph.models import RelationKind
+from pyxus.graph.models import ImportScope, RelationKind
 
 
 def _make_source_file(path: str, content: str = "") -> SourceFile:
@@ -181,3 +181,55 @@ class TestEdgeCases:
         result = resolve_imports(source, index, all_files)
         assert len(result.resolved) == 1
         assert result.resolved[0].target_file == "pkg/sub.py"
+
+
+class TestImportLocations:
+    def test_top_level_import(self):
+        """Top-level imports are tagged as scope=top_level."""
+        index, all_files = _make_file_index("main.py", "utils.py")
+        source = _make_source_file("main.py", "from utils import helper\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 1
+        assert result.resolved[0].location is not None
+        assert result.resolved[0].location.scope == ImportScope.TOP_LEVEL
+        assert result.resolved[0].location.function is None
+
+    def test_local_import_in_function(self):
+        """Imports inside a function are tagged as scope=local with function name."""
+        index, all_files = _make_file_index("main.py", "utils.py")
+        code = "def process():\n    from utils import helper\n    helper()\n"
+        source = _make_source_file("main.py", code)
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 1
+        assert result.resolved[0].location is not None
+        assert result.resolved[0].location.scope == ImportScope.LOCAL
+        assert result.resolved[0].location.function == "process"
+
+    def test_same_target_top_and_local(self):
+        """Same module imported top-level AND locally → one edge, both locations in metadata."""
+        index, all_files = _make_file_index("main.py", "utils.py")
+        code = "from utils import foo\n\ndef process():\n    from utils import bar\n"
+        source = _make_source_file("main.py", code)
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 2
+        # One relationship edge with both locations
+        assert len(result.relationships) == 1
+        meta = result.relationships[0].metadata
+        assert meta["has_top_level"] is True
+        assert meta["has_local"] is True
+        assert len(meta["locations"]) == 2
+
+    def test_multiple_local_imports_different_functions(self):
+        """Same module imported in two different functions → one edge, two local locations."""
+        index, all_files = _make_file_index("main.py", "utils.py")
+        code = "def foo():\n    from utils import a\n\ndef bar():\n    from utils import b\n"
+        source = _make_source_file("main.py", code)
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 2
+        assert len(result.relationships) == 1
+        meta = result.relationships[0].metadata
+        assert meta["has_local"] is True
+        assert meta["has_top_level"] is False
+        locations = meta["locations"]
+        functions = {loc["function"] for loc in locations}
+        assert functions == {"foo", "bar"}

@@ -12,6 +12,7 @@ from enum import StrEnum
 
 __all__ = [
     "CallReason",
+    "ImportScope",
     "RelationKind",
     "Relationship",
     "RiskLevel",
@@ -57,6 +58,13 @@ class RelationKind(StrEnum):
     CALLS = "calls"
     IMPORTS = "imports"
     EXTENDS = "extends"
+
+
+class ImportScope(StrEnum):
+    """Where an import statement appears in the source file."""
+
+    TOP_LEVEL = "top_level"
+    LOCAL = "local"
 
 
 class CallReason(StrEnum):
