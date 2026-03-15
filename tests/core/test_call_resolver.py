@@ -4,7 +4,7 @@ from pyxus.core.call_resolver import AssignmentGraph, CallResolutionResult, reso
 from pyxus.core.file_walker import SourceFile
 from pyxus.core.heritage import ClassHierarchy
 from pyxus.core.symbol_extractor import extract_symbols
-from pyxus.graph.models import CallReason, RelationKind, SymbolKind
+from pyxus.graph.models import CallReason, RelationKind, SymbolKind, parse_symbol_id
 from pyxus.graph.store import GraphStore
 
 
@@ -54,10 +54,8 @@ def _extract_resolved_names(result: CallResolutionResult) -> set[str]:
     names = set()
     for rel in result.relationships:
         if rel.kind == RelationKind.CALLS:
-            # Symbol ID format: "kind:file:name:line" — extract name
-            parts = rel.target_id.split(":")
-            if len(parts) >= 3:
-                names.add(parts[2])
+            _, _, name, _ = parse_symbol_id(rel.target_id)
+            names.add(name)
     return names
 
 
@@ -215,8 +213,8 @@ class TestSelfMethodCall:
         # Verify no cross-file edges: each relationship's source and target
         # must share the same file_path prefix in their symbol IDs
         for rel in result.relationships:
-            source_file = rel.source_id.split(":")[1]
-            target_file = rel.target_id.split(":")[1]
+            _, source_file, _, _ = parse_symbol_id(rel.source_id)
+            _, target_file, _, _ = parse_symbol_id(rel.target_id)
             assert source_file == target_file, f"Cross-file edge detected: {rel.source_id} -> {rel.target_id}"
 
 

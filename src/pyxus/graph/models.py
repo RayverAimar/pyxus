@@ -19,6 +19,7 @@ __all__ = [
     "SymbolKind",
     "make_relationship_id",
     "make_symbol_id",
+    "parse_symbol_id",
 ]
 
 
@@ -146,6 +147,20 @@ def make_symbol_id(kind: SymbolKind, file_path: str, name: str, line: int) -> st
         "class:services/profiles.py:ProfileService:42"
     """
     return f"{kind.value}:{file_path}:{name}:{line}"
+
+
+def parse_symbol_id(symbol_id: str) -> tuple[str, str, str, str]:
+    """Extract (kind, file_path, name, line) from a symbol ID string.
+
+    Inverse of make_symbol_id. Uses maxsplit=3 so file paths containing
+    colons (e.g., Windows paths) are handled correctly.
+
+    Example:
+        >>> parse_symbol_id("class:services/profiles.py:ProfileService:42")
+        ("class", "services/profiles.py", "ProfileService", "42")
+    """
+    parts = symbol_id.split(":", maxsplit=3)
+    return (parts[0], parts[1], parts[2], parts[3])
 
 
 def make_relationship_id(source_id: str, target_id: str, kind: RelationKind) -> str:

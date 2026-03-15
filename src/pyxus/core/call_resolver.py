@@ -33,6 +33,7 @@ from pyxus.graph.models import (
     Relationship,
     SymbolKind,
     make_relationship_id,
+    parse_symbol_id,
 )
 from pyxus.graph.store import GraphStore
 
@@ -179,19 +180,22 @@ def resolve_calls(
         if info[0] == SymbolKind.CLASS:
             ag.add_edge(f"{sym_id}.__return__", sym_id)
 
-    # Build per-file import aliases so that `from models import User` maps
-    # the local name `User` to the actual symbol ID from models.py
-    file_symbol_indexes = _build_per_file_indexes(files, symbol_index, graph)
-
-    # Phase 1: Seed the assignment graph from all files
-    call_sites: list[_CallSite] = []
+    # Parse all files once — reused across per-file index building, Phase 1, and Phase 2
+    parsed_files: list[tuple[SourceFile, ast.Module]] = []
     for source_file in files:
         try:
             tree = ast.parse(source_file.content, filename=source_file.path)
+            parsed_files.append((source_file, tree))
         except SyntaxError as e:
             logger.warning("Syntax error in %s (line %s): %s", source_file.path, e.lineno, e.msg)
-            continue
 
+    # Build per-file import aliases so that `from models import User` maps
+    # the local name `User` to the actual symbol ID from models.py
+    file_symbol_indexes = _build_per_file_indexes(parsed_files, symbol_index, graph)
+
+    # Phase 1: Seed the assignment graph from all files
+    call_sites: list[_CallSite] = []
+    for source_file, tree in parsed_files:
         file_index = file_symbol_indexes.get(source_file.path, symbol_index)
         collector = _AssignmentCollector(source_file.path, ag, file_index)
         collector.visit(tree)
@@ -200,12 +204,7 @@ def resolve_calls(
     # Phase 2: Fixed-point iteration — propagate assignments until stable
     for iteration in range(MAX_ITERATIONS):
         new_edges = 0
-        for source_file in files:
-            try:
-                tree = ast.parse(source_file.content, filename=source_file.path)
-            except SyntaxError as e:
-                logger.warning("Syntax error in %s (line %s): %s", source_file.path, e.lineno, e.msg)
-                continue
+        for source_file, tree in parsed_files:
             file_index = file_symbol_indexes.get(source_file.path, symbol_index)
             propagator = _AssignmentPropagator(source_file.path, ag, file_index)
             propagator.visit(tree)
@@ -238,40 +237,37 @@ def _build_symbol_index(graph: GraphStore) -> dict[str, str]:
     always unique and used by the resolver for AG-resolved calls.
     """
     index: dict[str, str] = {}
-    # Track names seen more than once to avoid wrong attribution
-    name_counts: dict[str, int] = {}
+    ambiguous: set[str] = set()  # names seen more than once — excluded from index
 
     for symbol in graph.symbols():
         if symbol.kind == SymbolKind.MODULE:
             continue
 
-        name_counts[symbol.name] = name_counts.get(symbol.name, 0) + 1
-        # Only set bare name if unambiguous (first occurrence)
-        if name_counts[symbol.name] == 1:
-            index[symbol.name] = symbol.id
-        elif name_counts[symbol.name] == 2:
-            # Second occurrence — remove the bare name to avoid wrong attribution
-            index.pop(symbol.name, None)
+        _index_name(index, ambiguous, symbol.name, symbol.id)
 
         if symbol.kind in (SymbolKind.METHOD, SymbolKind.STATICMETHOD, SymbolKind.CLASSMETHOD, SymbolKind.PROPERTY):
             owners = graph.predecessors_by_kind(symbol.id, RelationKind.HAS_METHOD)
             for owner in owners:
-                # Name-based: "ClassName.method" — prune on collision
-                qualified = f"{owner.name}.{symbol.name}"
-                name_counts[qualified] = name_counts.get(qualified, 0) + 1
-                if name_counts[qualified] == 1:
-                    index[qualified] = symbol.id
-                elif name_counts[qualified] == 2:
-                    index.pop(qualified, None)
-
-                # ID-based: "{class_symbol_id}.method" — always unique
+                _index_name(index, ambiguous, f"{owner.name}.{symbol.name}", symbol.id)
+                # ID-based: always unique, used for AG-resolved calls
                 index[f"{owner.id}.{symbol.name}"] = symbol.id
 
     return index
 
 
+def _index_name(index: dict[str, str], ambiguous: set[str], name: str, sym_id: str) -> None:
+    """Add a name to the index, removing it if ambiguous (seen more than once)."""
+    if name in ambiguous:
+        return
+    if name in index:
+        index.pop(name)
+        ambiguous.add(name)
+    else:
+        index[name] = sym_id
+
+
 def _build_per_file_indexes(
-    files: list[SourceFile],
+    parsed_files: list[tuple[SourceFile, ast.Module]],
     global_index: dict[str, str],
     graph: GraphStore,
 ) -> dict[str, dict[str, str]]:
@@ -295,19 +291,14 @@ def _build_per_file_indexes(
             file_local_symbols[fpath] = {}
         file_local_symbols[fpath][name] = sym_id
 
-    # Build module_path → file_path mapping (for resolving import targets)
     from pyxus.core.import_resolver import build_file_index
 
-    module_to_file = build_file_index(files)
+    source_files = [sf for sf, _ in parsed_files]
+    module_to_file = build_file_index(source_files)
 
     result: dict[str, dict[str, str]] = {}
 
-    for source_file in files:
-        try:
-            tree = ast.parse(source_file.content, filename=source_file.path)
-        except SyntaxError:
-            continue
-
+    for source_file, tree in parsed_files:
         import_aliases: dict[str, str] = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
@@ -320,7 +311,6 @@ def _build_per_file_indexes(
                             import_aliases[local_name] = sym_id
 
             elif isinstance(node, ast.ImportFrom) and node.level > 0:
-                # Relative import: resolve relative to current file's package
                 parts = list(PurePosixPath(source_file.path).parts[:-1])
                 steps_up = node.level - 1
                 if steps_up <= len(parts):
@@ -622,10 +612,10 @@ class _AssignmentPropagator(_NamespaceTrackingVisitor):
             id_qualified = f"{pointee}.{method_name}"
             if id_qualified in self.symbol_index:
                 return f"{self.symbol_index[id_qualified]}.__return__"
-            # Name-based fallback
-            parts = pointee.split(":")
-            if len(parts) >= 4 and parts[0] == "class":
-                name_qualified = f"{parts[2]}.{method_name}"
+            # Name-based fallback: if pointee is a class symbol ID, use its name
+            if pointee.startswith("class:"):
+                _, _, class_name, _ = parse_symbol_id(pointee)
+                name_qualified = f"{class_name}.{method_name}"
                 if name_qualified in self.symbol_index:
                     return f"{self.symbol_index[name_qualified]}.__return__"
         return None
@@ -654,12 +644,11 @@ class _CallResolver:
         self._id_to_info = id_to_info
         self._module_ns_index = module_ns_index
         self._hierarchy = hierarchy
-        # (file_path, class_name) → class_symbol_id for file-aware class lookup
-        self._file_class_index: dict[tuple[str, str], str] = {}
+        # (file_path, symbol_name) → symbol_id for file-aware lookups
+        self._file_symbol_index: dict[tuple[str, str], str] = {}
         for sym_id, info in id_to_info.items():
-            if info[0] == SymbolKind.CLASS:
-                file_path = sym_id.split(":")[1]
-                self._file_class_index[(file_path, info[1])] = sym_id
+            _, file_path, _, _ = parse_symbol_id(sym_id)
+            self._file_symbol_index[(file_path, info[1])] = sym_id
 
     def extract_call_edges(self, call_sites: list[_CallSite]) -> CallResolutionResult:
         """Convert resolved call sites into CALLS relationships."""
@@ -672,7 +661,7 @@ class _CallResolver:
             callee_id = self._resolve_callee(site)
 
             if callee_id:
-                caller_id = self._find_enclosing_symbol(site.caller_ns)
+                caller_id = self._find_enclosing_symbol(site)
                 if caller_id and (caller_id, callee_id) not in seen_edges:
                     seen_edges.add((caller_id, callee_id))
                     relationships.append(
@@ -754,9 +743,11 @@ class _CallResolver:
         """Find the class symbol ID that encloses a call site, using file context."""
         parts = site.caller_ns.split(".")
         for i in range(len(parts) - 1, 0, -1):
-            class_id = self._file_class_index.get((site.file_path, parts[i]))
-            if class_id:
-                return class_id
+            sym_id = self._file_symbol_index.get((site.file_path, parts[i]))
+            if sym_id:
+                info = self._id_to_info.get(sym_id)
+                if info and info[0] == SymbolKind.CLASS:
+                    return sym_id
         return None
 
     def _try_class_method(self, pointee: str, method_name: str) -> str | None:
@@ -774,12 +765,12 @@ class _CallResolver:
         if id_qualified in self._symbol_index:
             return self._symbol_index[id_qualified]
 
-        # Name-based fallback for unambiguous names
+        # Name-based: "ClassName.method" (ambiguous names were pruned at index build time)
         name_qualified = f"{info[1]}.{method_name}"
         if name_qualified in self._symbol_index:
             return self._symbol_index[name_qualified]
 
-        # MRO walk: method inherited from a parent class
+        # MRO walk: method defined on a parent class not directly indexed on this class
         owner_id = self._hierarchy.resolve_attribute(pointee, method_name)
         if owner_id:
             inherited = f"{owner_id}.{method_name}"
@@ -870,9 +861,13 @@ class _CallResolver:
         # All parents are external (stdlib, third-party) → external
         return CallReason.EXTERNAL
 
-    def _find_enclosing_symbol(self, namespace: str) -> str | None:
-        """Find the symbol ID of the function/method that contains a given namespace."""
-        parts = namespace.split(".")
+    def _find_enclosing_symbol(self, site: _CallSite) -> str | None:
+        """Find the symbol ID of the function/method that contains a call site.
+
+        Walks the namespace backwards trying qualified names (ClassName.method)
+        then simple names. Falls back to the module symbol for module-level calls.
+        """
+        parts = site.caller_ns.split(".")
 
         for i in range(len(parts) - 1, 0, -1):
             if i + 1 < len(parts):
