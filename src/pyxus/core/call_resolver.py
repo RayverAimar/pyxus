@@ -679,24 +679,24 @@ def _classify_unresolved(
     symbol_index: dict[str, str],
     id_to_info: dict[str, tuple[SymbolKind, str]],
 ) -> CallReason:
-    """Classify an unresolved call as external or internal."""
+    """Classify an unresolved call as external or internal.
+
+    For dotted calls (obj.method), checks whether the OBJECT resolves to
+    a repo class via the AG. A method name existing somewhere in the repo
+    is not sufficient — "close" exists in both repo classes and stdlib.
+    """
     callee = site.callee_name
 
     if "." not in callee:
         return CallReason.UNRESOLVED_INTERNAL if callee in symbol_index else CallReason.EXTERNAL
 
-    obj_name, method_name = callee.rsplit(".", 1)
-
-    # If the method name exists on any class in the repo, it's likely internal
-    qualified_match = any(key.endswith(f".{method_name}") for key in symbol_index if "." in key)
-    if qualified_match:
-        return CallReason.UNRESOLVED_INTERNAL
-
-    # Object resolves to a repo symbol but method not found → external method
+    obj_name, _ = callee.rsplit(".", 1)
     obj_ns = f"{site.caller_ns}.{obj_name}"
+
+    # Check if the object resolves to a repo class via the assignment graph
     for pointee in ag.get_pointees(obj_ns):
         if pointee in id_to_info:
-            return CallReason.EXTERNAL
+            return CallReason.UNRESOLVED_INTERNAL
 
     return CallReason.EXTERNAL
 

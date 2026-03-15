@@ -265,21 +265,30 @@ class TestCoverageStats:
             "        pass\n"
             "\n"
             "Foo.bar()\n"
-            "unknown.bar()\n"  # 'bar' exists in repo → unresolved_internal
+            "unknown.bar()\n"  # unknown doesn't resolve to a repo class → external
         )
         result = _make_call_resolution({"test.py": code})
         assert result.stats.total_calls >= 2
         assert result.stats.resolved >= 1
-        assert len(result.unresolved) >= 1
+        assert result.stats.external >= 1
 
-    def test_unresolved_call_tracked(self):
-        """A call to an unknown object with a method that exists in the repo is unresolved_internal."""
+    def test_unknown_object_classified_as_external(self):
+        """A call on an unknown object is external — even if the method name
+        exists in the repo. Classification is based on the OBJECT, not the method."""
         code = (
             "class Svc:\n"
             "    def run(self): pass\n"
             "\n"
             "unknown_obj.run()\n"  # 'run' exists in repo but unknown_obj has no type info
         )
+        result = _make_call_resolution({"test.py": code})
+        assert result.stats.external >= 1
+        assert len(result.unresolved) == 0
+
+    def test_known_object_unknown_method_is_internal(self):
+        """When the object resolves to a repo class but the method doesn't exist,
+        that's a genuine unresolved internal call."""
+        code = "class Svc:\n    def run(self): pass\n\ns = Svc()\ns.nonexistent()\n"
         result = _make_call_resolution({"test.py": code})
         assert len(result.unresolved) >= 1
         assert result.unresolved[0].reason == CallReason.UNRESOLVED_INTERNAL
