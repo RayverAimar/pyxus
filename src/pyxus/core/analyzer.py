@@ -214,11 +214,16 @@ def _phase_calls(
             graph.add_relationship(rel)
 
     stats.calls_resolved = call_result.stats.resolved
-    stats.calls_unresolved = call_result.stats.total_calls - call_result.stats.resolved
-    if call_result.stats.total_calls > 0:
-        stats.call_resolution_rate = call_result.stats.resolved / call_result.stats.total_calls
+    stats.calls_unresolved = call_result.stats.internal_calls - call_result.stats.resolved
+    stats.call_resolution_rate = call_result.stats.internal_resolution_rate
 
-    logger.info("Resolved %d calls (%.1f%%)", stats.calls_resolved, stats.call_resolution_rate * 100)
+    logger.info(
+        "Resolved %d / %d intra-repo calls (%.1f%%), %d external",
+        stats.calls_resolved,
+        call_result.stats.internal_calls,
+        stats.call_resolution_rate * 100,
+        call_result.stats.external,
+    )
     return call_result
 
 
@@ -281,7 +286,7 @@ def _get_head_commit(repo_path: str) -> str | None:
     """Get the current HEAD commit hash for tracking incremental changes."""
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "rev-parse", "--short", "HEAD"],  # noqa: S607
             cwd=repo_path,
             capture_output=True,
             text=True,

@@ -2,7 +2,7 @@
 
 
 class Registry:
-    _processors = {}
+    _processors = {}  # noqa: RUF012
 
     @classmethod
     def register(cls, name, processor_cls):

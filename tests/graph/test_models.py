@@ -57,14 +57,14 @@ class TestSymbol:
         assert {s}
 
     def test_symbol_equality_ignores_metadata(self):
-        kwargs = dict(
-            id="class:f.py:Foo:1",
-            name="Foo",
-            kind=SymbolKind.CLASS,
-            file_path="f.py",
-            start_line=1,
-            end_line=10,
-        )
+        kwargs = {
+            "id": "class:f.py:Foo:1",
+            "name": "Foo",
+            "kind": SymbolKind.CLASS,
+            "file_path": "f.py",
+            "start_line": 1,
+            "end_line": 10,
+        }
         s1 = Symbol(**kwargs, metadata={"django_model": True})
         s2 = Symbol(**kwargs, metadata={})
         assert s1 == s2

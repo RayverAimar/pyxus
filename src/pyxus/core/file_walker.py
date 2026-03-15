@@ -112,7 +112,7 @@ def _git_ls_files(repo: Path) -> list[Path] | None:
     """
     try:
         result = subprocess.run(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "*.py"],
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "*.py"],  # noqa: S607
             cwd=repo,
             capture_output=True,
             text=True,
@@ -159,8 +159,8 @@ def get_modified_files(repo_path: str, since_commit: str | None = None) -> list[
         return []
 
     try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", since_commit, "HEAD", "--", "*.py"],
+        result = subprocess.run(  # noqa: S603
+            ["git", "diff", "--name-only", since_commit, "HEAD", "--", "*.py"],  # noqa: S607
             cwd=repo_path,
             capture_output=True,
             text=True,

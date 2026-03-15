@@ -157,7 +157,5 @@ class ClassHierarchy:
                 continue
             seen.add(current)
             visited.append(current)
-            for base in reversed(self._bases.get(current, [])):
-                if base not in seen:
-                    stack.append(base)
+            stack.extend(base for base in reversed(self._bases.get(current, [])) if base not in seen)
         return visited

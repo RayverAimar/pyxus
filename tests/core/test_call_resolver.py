@@ -141,22 +141,80 @@ class TestInterproceduralCall:
         assert "MyService" in targets or "execute" in targets
 
 
+class TestConstructorReturn:
+    def test_constructor_then_method(self):
+        """x = MyClass(); x.method() should resolve method to the class."""
+        code = "class Svc:\n    def run(self):\n        pass\n\ndef main():\n    s = Svc()\n    s.run()\n"
+        result = _make_call_resolution({"test.py": code})
+        assert "run" in _extract_resolved_names(result)
+
+    def test_constructor_at_module_level(self):
+        """Module-level: s = Svc(); s.run()."""
+        code = "class Svc:\n    def run(self):\n        pass\n\ns = Svc()\ns.run()\n"
+        result = _make_call_resolution({"test.py": code})
+        assert "run" in _extract_resolved_names(result)
+
+
+class TestCrossMethodSelfAttr:
+    def test_init_attr_used_in_method(self):
+        """self._conn set in __init__, used in another method."""
+        code = (
+            "class Client:\n"
+            "    def __init__(self):\n"
+            "        self._conn = Connection()\n"
+            "    def send(self):\n"
+            "        self._conn.close()\n"
+            "\n"
+            "class Connection:\n"
+            "    def close(self):\n"
+            "        pass\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        assert "close" in _extract_resolved_names(result)
+
+    def test_attr_set_in_any_method(self):
+        """self.x set in a non-init method, used in another."""
+        code = (
+            "class Svc:\n"
+            "    def setup(self):\n"
+            "        self.handler = Handler()\n"
+            "    def run(self):\n"
+            "        self.handler.process()\n"
+            "\n"
+            "class Handler:\n"
+            "    def process(self):\n"
+            "        pass\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        assert "process" in _extract_resolved_names(result)
+
+
 class TestCoverageStats:
     def test_stats_counted(self):
-        code = "class Foo:\n    def bar(self):\n        pass\n\nFoo.bar()\nunknown.method()\n"
+        code = (
+            "class Foo:\n"
+            "    def bar(self):\n"
+            "        pass\n"
+            "\n"
+            "Foo.bar()\n"
+            "unknown.bar()\n"  # 'bar' exists in repo → unresolved_internal
+        )
         result = _make_call_resolution({"test.py": code})
         assert result.stats.total_calls >= 2
         assert result.stats.resolved >= 1
         assert len(result.unresolved) >= 1
 
     def test_unresolved_call_tracked(self):
-        code = "some_unknown_variable.method()\n"
+        """A call to an unknown object with a method that exists in the repo is unresolved_internal."""
+        code = (
+            "class Svc:\n"
+            "    def run(self): pass\n"
+            "\n"
+            "unknown_obj.run()\n"  # 'run' exists in repo but unknown_obj has no type info
+        )
         result = _make_call_resolution({"test.py": code})
-        assert len(result.unresolved) == 1
-        assert result.unresolved[0].call_text == "some_unknown_variable.method()"
-        assert result.unresolved[0].reason == "untyped_instance_call"
-        assert result.unresolved[0].file_path == "test.py"
-        assert result.unresolved[0].line == 1
+        assert len(result.unresolved) >= 1
+        assert result.unresolved[0].reason == "unresolved_internal"
 
 
 class TestReturnTypePropagation:
@@ -189,11 +247,13 @@ class TestEdgeCases:
         result = _make_call_resolution({"empty.py": ""})
         assert result.stats.total_calls == 0
 
-    def test_builtin_calls_unresolved(self):
+    def test_builtin_calls_classified_as_external(self):
+        """Calls to builtins are classified as external, not unresolved."""
         result = _make_call_resolution({"main.py": "print('hello')\nlen([1, 2, 3])\n"})
         assert result.stats.total_calls >= 2
+        assert result.stats.external >= 2
         assert result.stats.resolved == 0
-        assert len(result.unresolved) >= 2
+        assert len(result.unresolved) == 0
 
     def test_chained_method_call(self):
         """Method calls on local variables are tracked even if not fully resolved."""

@@ -59,15 +59,16 @@ def analyze(path: str, incremental: bool, quiet: bool) -> None:
 
     if result.call_resolution:
         cr = result.call_resolution
-        total = cr.stats.total_calls
-        resolved = cr.stats.resolved
-        rate = (resolved / total * 100) if total > 0 else 0
+        s = cr.stats
+        internal_rate = s.internal_resolution_rate * 100
 
-        click.echo(f"\n  Call Resolution: {rate:.1f}% ({resolved} / {total})")
+        click.echo(f"\n  Calls: {s.total_calls} total, {s.external} external (stdlib/third-party)")
+        click.echo(f"  Intra-repo resolution: {internal_rate:.1f}% ({s.resolved} / {s.internal_calls})")
 
-        if cr.stats.unresolved_by_reason:
-            click.echo(f"  Unresolved: {total - resolved} calls")
-            for reason, count in sorted(cr.stats.unresolved_by_reason.items(), key=lambda x: -x[1]):
+        if s.unresolved_by_reason:
+            unresolved_internal = s.internal_calls - s.resolved
+            click.echo(f"  Unresolved intra-repo: {unresolved_internal}")
+            for reason, count in sorted(s.unresolved_by_reason.items(), key=lambda x: -x[1]):
                 click.echo(f"    {count:>5} — {reason}")
 
     click.echo("\n  Saved to .pyxus/")

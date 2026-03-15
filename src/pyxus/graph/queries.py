@@ -101,7 +101,6 @@ def impact(
     if not matches:
         return {"error": f"No symbol found matching '{target}'"}
 
-    # CR-008: Apply same disambiguation as context() when multiple matches
     if len(matches) > 1:
         return _disambiguation_response(matches)
 

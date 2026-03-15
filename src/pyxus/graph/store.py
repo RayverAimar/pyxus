@@ -98,8 +98,7 @@ class GraphStore:
             return []
         result = []
         for pred_idx in self._graph.predecessor_indices(idx):
-            for rel in self._graph.get_all_edge_data(pred_idx, idx):
-                result.append((self._graph[pred_idx], rel))
+            result.extend((self._graph[pred_idx], rel) for rel in self._graph.get_all_edge_data(pred_idx, idx))
         return result
 
     def successors(self, symbol_id: str) -> list[tuple[Symbol, Relationship]]:
@@ -113,8 +112,7 @@ class GraphStore:
             return []
         result = []
         for succ_idx in self._graph.successor_indices(idx):
-            for rel in self._graph.get_all_edge_data(idx, succ_idx):
-                result.append((self._graph[succ_idx], rel))
+            result.extend((self._graph[succ_idx], rel) for rel in self._graph.get_all_edge_data(idx, succ_idx))
         return result
 
     def predecessors_by_kind(self, symbol_id: str, kind: RelationKind) -> list[Symbol]:

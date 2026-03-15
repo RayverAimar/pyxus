@@ -62,7 +62,19 @@ class ResolutionStats:
 
     total_calls: int = 0
     resolved: int = 0
+    external: int = 0
     unresolved_by_reason: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def internal_calls(self) -> int:
+        """Calls that target symbols in the repo (resolved + unresolved internal)."""
+        return self.total_calls - self.external
+
+    @property
+    def internal_resolution_rate(self) -> float:
+        """Resolution rate considering only intra-repo calls."""
+        internal = self.internal_calls
+        return self.resolved / internal if internal > 0 else 0.0
 
 
 @dataclass
@@ -152,6 +164,17 @@ def resolve_calls(
         else:
             id_to_info[sym.id] = (sym.kind, sym.name)
 
+    # Seed constructor returns: MyClass() returns an instance of MyClass.
+    # Without this, `x = MyClass(); x.method()` can never resolve because
+    # MyClass.__return__ has no edges in the assignment graph.
+    for sym_id, info in id_to_info.items():
+        if info[0] == SymbolKind.CLASS:
+            ag.add_edge(f"{sym_id}.__return__", sym_id)
+
+    # Build per-file import aliases so that `from models import User` maps
+    # the local name `User` to the actual symbol ID from models.py
+    file_symbol_indexes = _build_per_file_indexes(files, symbol_index, graph)
+
     # Phase 1: Seed the assignment graph from all files
     call_sites: list[_CallSite] = []
     for source_file in files:
@@ -161,7 +184,8 @@ def resolve_calls(
             logger.warning("Syntax error in %s (line %s): %s", source_file.path, e.lineno, e.msg)
             continue
 
-        collector = _AssignmentCollector(source_file.path, ag, symbol_index)
+        file_index = file_symbol_indexes.get(source_file.path, symbol_index)
+        collector = _AssignmentCollector(source_file.path, ag, file_index)
         collector.visit(tree)
         call_sites.extend(collector.call_sites)
 
@@ -218,6 +242,74 @@ def _build_symbol_index(graph: GraphStore) -> dict[str, str]:
                 index[f"{owner.name}.{symbol.name}"] = symbol.id
 
     return index
+
+
+def _build_per_file_indexes(
+    files: list[SourceFile],
+    global_index: dict[str, str],
+    graph: GraphStore,
+) -> dict[str, dict[str, str]]:
+    """Build per-file symbol indexes that include import aliases.
+
+    For each file, parses its import statements and maps imported names to
+    their symbol IDs. Returns a dict of file_path → merged symbol index
+    (global index + file-specific import aliases).
+    """
+    # Build a lookup: (file_path, symbol_name) → symbol_id for all symbols
+    file_name_to_id: dict[tuple[str, str], str] = {}
+    for sym in graph.symbols():
+        if sym.kind != SymbolKind.MODULE:
+            file_name_to_id[(sym.file_path, sym.name)] = sym.id
+
+    # Build module_path → file_path mapping (for resolving import targets)
+    from pyxus.core.import_resolver import build_file_index
+
+    module_to_file = build_file_index(files)
+
+    result: dict[str, dict[str, str]] = {}
+
+    for source_file in files:
+        try:
+            tree = ast.parse(source_file.content, filename=source_file.path)
+        except SyntaxError:
+            continue
+
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                target_file = module_to_file.get(node.module)
+                if target_file:
+                    for alias in node.names:
+                        local_name = alias.asname or alias.name
+                        sym_id = file_name_to_id.get((target_file, alias.name))
+                        if sym_id:
+                            aliases[local_name] = sym_id
+
+            elif isinstance(node, ast.ImportFrom) and node.level > 0:
+                # Relative import: resolve relative to current file's package
+                from pathlib import PurePosixPath
+
+                parts = list(PurePosixPath(source_file.path).parts[:-1])
+                steps_up = node.level - 1
+                if steps_up <= len(parts):
+                    if steps_up > 0:
+                        parts = parts[:-steps_up]
+                    module = node.module or ""
+                    target_module = ".".join(parts + module.split(".")) if module else ".".join(parts)
+                    target_file = module_to_file.get(target_module)
+                    if target_file:
+                        for alias in node.names:
+                            local_name = alias.asname or alias.name
+                            sym_id = file_name_to_id.get((target_file, alias.name))
+                            if sym_id:
+                                aliases[local_name] = sym_id
+
+        if aliases:
+            merged = dict(global_index)
+            merged.update(aliases)
+            result[source_file.path] = merged
+
+    return result
 
 
 # ── AST helpers (using shared get_dotted_name from ast_utils) ─────────────
@@ -332,6 +424,11 @@ class _NamespaceTrackingVisitor(ast.NodeVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    def visit_For(self, node: ast.For) -> None:
+        """Connect loop variable to iterable so `for x in items: x.method()` can resolve."""
+        # Subclasses that have `ag` and `symbol_index` will create the edge
+        self.generic_visit(node)
+
 
 class _AssignmentCollector(_NamespaceTrackingVisitor):
     """First pass: collect assignments and call sites from the AST."""
@@ -358,6 +455,15 @@ class _AssignmentCollector(_NamespaceTrackingVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    def visit_For(self, node: ast.For) -> None:
+        target_name = _get_assign_target_name(node.target)
+        if target_name:
+            target_ns = f"{self._current_ns}.{target_name}"
+            iter_ns = _resolve_expr(node.iter, self._current_ns, self.symbol_index)
+            if iter_ns:
+                self.ag.add_edge(target_ns, iter_ns)
+        self.generic_visit(node)
+
     def visit_Assign(self, node: ast.Assign) -> None:
         for target in node.targets:
             target_name = _get_assign_target_name(target)
@@ -366,6 +472,14 @@ class _AssignmentCollector(_NamespaceTrackingVisitor):
                 value_ns = _resolve_expr(node.value, self._current_ns, self.symbol_index)
                 if value_ns:
                     self.ag.add_edge(target_ns, value_ns)
+
+                    # Promote self.attr assignments to class level so other methods
+                    # can resolve self.attr.method() via the class namespace
+                    class_name = self._enclosing_class_name
+                    if class_name and class_name in self.symbol_index and target_name.startswith("self."):
+                        class_id = self.symbol_index[class_name]
+                        attr = target_name[5:]  # strip "self."
+                        self.ag.add_edge(f"{class_id}.{attr}", value_ns)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -407,6 +521,20 @@ class _AssignmentPropagator(_NamespaceTrackingVisitor):
             value_ns = _resolve_expr(node.value, self._current_ns, self.symbol_index)
             if value_ns and self.ag.add_edge(return_ns, value_ns):
                 self.new_edges += 1
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        """Re-connect arguments to parameters using information from previous iterations."""
+        callee_name = _get_call_name(node)
+        if callee_name:
+            callee_id = self.symbol_index.get(callee_name)
+            if callee_id and node.args:
+                for i, arg in enumerate(node.args):
+                    arg_ns = _resolve_expr(arg, self._current_ns, self.symbol_index)
+                    if arg_ns:
+                        param_ns = f"{callee_id}.param_{i}"
+                        if self.ag.add_edge(param_ns, arg_ns):
+                            self.new_edges += 1
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -453,18 +581,61 @@ def _extract_call_edges(
                 )
                 stats.resolved += 1
         else:
-            reason = "untyped_instance_call" if "." in site.callee_name else "unresolved_function"
-            unresolved.append(
-                UnresolvedCall(
-                    file_path=site.file_path,
-                    line=site.line,
-                    call_text=site.call_text,
-                    reason=reason,
+            reason = _classify_unresolved(site, ag, symbol_index, id_to_info)
+            if reason == "external":
+                stats.external += 1
+            else:
+                unresolved.append(
+                    UnresolvedCall(
+                        file_path=site.file_path,
+                        line=site.line,
+                        call_text=site.call_text,
+                        reason=reason,
+                    )
                 )
-            )
-            stats.unresolved_by_reason[reason] = stats.unresolved_by_reason.get(reason, 0) + 1
+                stats.unresolved_by_reason[reason] = stats.unresolved_by_reason.get(reason, 0) + 1
 
     return CallResolutionResult(relationships=relationships, unresolved=unresolved, stats=stats)
+
+
+def _classify_unresolved(
+    site: _CallSite,
+    ag: AssignmentGraph,
+    symbol_index: dict[str, str],
+    id_to_info: dict[str, tuple[SymbolKind, str]],
+) -> str:
+    """Classify an unresolved call as external or internal.
+
+    - "external": the call target is not defined in the repo (stdlib, third-party, builtins)
+    - "unresolved_internal": the target likely exists in the repo but we couldn't resolve it
+    """
+    callee = site.callee_name
+
+    if "." not in callee:
+        # Simple function call: foo()
+        # If the name exists anywhere in the repo's symbols, it's internal
+        return "unresolved_internal" if callee in symbol_index else "external"
+
+    # Dotted call: obj.method()
+    obj_name, method_name = callee.rsplit(".", 1)
+
+    # Check if the method name exists on any class in the repo
+    # If no class in the repo defines this method, it's likely external
+    qualified_match = any(key.endswith(f".{method_name}") for key in symbol_index if "." in key)
+    if qualified_match:
+        # The method exists in the repo — we just couldn't resolve which class
+        return "unresolved_internal"
+
+    # Check if the object resolves to something in the AG
+    obj_ns = f"{site.caller_ns}.{obj_name}"
+    pointees = ag.get_pointees(obj_ns)
+    for pointee in pointees:
+        if pointee in id_to_info:
+            # Object resolves to a repo symbol but method not found → external method on internal object
+            return "external"
+
+    # Can't determine — the object doesn't resolve and the method name isn't in the repo
+    return "external"
 
 
 def _resolve_callee(
@@ -487,14 +658,51 @@ def _resolve_callee(
     obj_name, attr_name = site.callee_name.rsplit(".", 1)
     obj_ns = f"{site.caller_ns}.{obj_name}"
 
+    # Strategy 2a: Direct AG lookup for the full object path
     for pointee in ag.get_pointees(obj_ns):
-        info = id_to_info.get(pointee)
-        if info and info[0] == SymbolKind.CLASS:
-            class_name = info[1]
-            qualified = f"{class_name}.{attr_name}"
-            if qualified in symbol_index:
-                return symbol_index[qualified]
+        resolved = _try_class_method(pointee, attr_name, id_to_info, symbol_index)
+        if resolved:
+            return resolved
 
+    # Strategy 2b: Step-by-step resolution for dotted objects (e.g., self._conn.send)
+    # Resolve each segment through the AG to handle class-level attributes
+    if "." in obj_name:
+        parts = obj_name.split(".")
+        current_ns = f"{site.caller_ns}.{parts[0]}"
+        for part in parts[1:]:
+            pointees = ag.get_pointees(current_ns)
+            resolved_next = False
+            for pointee in pointees:
+                # If pointee is a class, look up the attribute at class level
+                info = id_to_info.get(pointee)
+                if info and info[0] == SymbolKind.CLASS:
+                    current_ns = f"{pointee}.{part}"
+                    resolved_next = True
+                    break
+            if not resolved_next:
+                break
+        else:
+            # All parts resolved — now resolve the final method call
+            for pointee in ag.get_pointees(current_ns):
+                resolved = _try_class_method(pointee, attr_name, id_to_info, symbol_index)
+                if resolved:
+                    return resolved
+
+    return None
+
+
+def _try_class_method(
+    pointee: str,
+    method_name: str,
+    id_to_info: dict[str, tuple[SymbolKind, str]],
+    symbol_index: dict[str, str],
+) -> str | None:
+    """If pointee is a CLASS, look up ClassName.method_name in the symbol index."""
+    info = id_to_info.get(pointee)
+    if info and info[0] == SymbolKind.CLASS:
+        qualified = f"{info[1]}.{method_name}"
+        if qualified in symbol_index:
+            return symbol_index[qualified]
     return None
 
 

@@ -52,19 +52,19 @@ class TestAnalyzeCommand:
         runner = CliRunner()
         result = runner.invoke(main, ["analyze", project])
         assert result.exit_code == 0
-        assert "Call Resolution" in result.output
+        assert "Intra-repo resolution" in result.output
 
-    def test_analyze_shows_unresolved_calls(self, tmp_path):
+    def test_analyze_shows_external_calls(self, tmp_path):
         project = make_project(
             tmp_path,
             {
-                "main.py": ("class Svc:\n    def run(self): pass\n\nSvc.run()\nunknown_obj.method()\n"),
+                "main.py": "class Svc:\n    def run(self): pass\n\nSvc.run()\nprint('hi')\n",
             },
         )
         runner = CliRunner()
         result = runner.invoke(main, ["analyze", project])
         assert result.exit_code == 0
-        assert "Unresolved:" in result.output
+        assert "external" in result.output
 
 
 class TestStatusCommand:
