@@ -8,18 +8,6 @@ from pyxus.graph.models import CallReason, RelationKind, SymbolKind
 from pyxus.graph.store import GraphStore
 
 
-def _make_graph_from_code(code: str, path: str = "test.py") -> tuple[GraphStore, list[SourceFile]]:
-    """Build a graph from a single code string for testing."""
-    sf = SourceFile(path=path, absolute_path=f"/tmp/{path}", content=code)
-    graph = GraphStore()
-    result = extract_symbols(sf)
-    for sym in result.symbols:
-        graph.add_symbol(sym)
-    for rel in result.relationships:
-        graph.add_relationship(rel)
-    return graph, [sf]
-
-
 def _make_call_resolution(codes: dict[str, str]) -> CallResolutionResult:
     """Resolve calls from multiple source code strings for testing."""
     from pyxus.core.heritage import extract_heritage

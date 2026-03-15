@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import ast
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 from pyxus.core.ast_utils import get_dotted_name
 from pyxus.core.file_walker import SourceFile
@@ -62,7 +64,7 @@ class ResolutionStats:
     total_calls: int = 0
     resolved: int = 0
     external: int = 0
-    unresolved_by_reason: dict[CallReason, int] = field(default_factory=dict)
+    unresolved_by_reason: defaultdict[CallReason, int] = field(default_factory=lambda: defaultdict(int))
 
     @property
     def internal_calls(self) -> int:
@@ -113,6 +115,8 @@ class AssignmentGraph:
 
         Uses BFS with a depth limit to handle cycles safely. A node is
         "concrete" if it has no unvisited outgoing edges (leaf or cycle endpoint).
+        Nodes still in the frontier when max_depth is reached are included
+        as pointees — they are real targets that simply live deeper in the graph.
         """
         result: set[str] = set()
         visited: set[str] = set()
@@ -125,7 +129,6 @@ class AssignmentGraph:
                 if node in visited:
                     continue
                 visited.add(node)
-                # Only follow edges to nodes we haven't seen yet
                 unvisited_targets = self._edges.get(node, set()) - visited
                 if not unvisited_targets:
                     result.add(node)
@@ -133,6 +136,9 @@ class AssignmentGraph:
                     next_frontier.update(unvisited_targets)
             frontier = next_frontier
             depth += 1
+
+        # Nodes at the depth boundary are real pointees — don't discard them
+        result.update(frontier - visited)
 
         return result
 
@@ -315,8 +321,6 @@ def _build_per_file_indexes(
 
             elif isinstance(node, ast.ImportFrom) and node.level > 0:
                 # Relative import: resolve relative to current file's package
-                from pathlib import PurePosixPath
-
                 parts = list(PurePosixPath(source_file.path).parts[:-1])
                 steps_up = node.level - 1
                 if steps_up <= len(parts):
@@ -426,11 +430,6 @@ class _NamespaceTrackingVisitor(ast.NodeVisitor):
         return ".".join(self._ns_stack)
 
     @property
-    def _inside_class(self) -> bool:
-        """True when the immediate enclosing scope is a class (not a function)."""
-        return bool(self._class_stack) and self._ns_stack[-1] != self._class_stack[-1]
-
-    @property
     def _enclosing_class_name(self) -> str | None:
         return self._class_stack[-1] if self._class_stack else None
 
@@ -447,10 +446,6 @@ class _NamespaceTrackingVisitor(ast.NodeVisitor):
         self._ns_stack.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef
-
-    def visit_For(self, node: ast.For) -> None:
-        """Connect loop variable to iterable so `for x in items: x.method()` can resolve."""
-        self.generic_visit(node)
 
 
 class _AssignmentCollector(_NamespaceTrackingVisitor):
@@ -553,18 +548,17 @@ class _AssignmentCollector(_NamespaceTrackingVisitor):
             # Connect arguments to parameters inter-procedurally
             callee_id = self.symbol_index.get(callee_name)
             if callee_id and node.args:
-                for i, arg in enumerate(node.args):
-                    arg_ns = _resolve_expr(arg, self._current_ns, self.symbol_index)
+                arg_nses = [_resolve_expr(arg, self._current_ns, self.symbol_index) for arg in node.args]
+                for i, arg_ns in enumerate(arg_nses):
                     if arg_ns:
                         self.ag.add_edge(f"{callee_id}.param_{i}", arg_ns)
 
-                # Constructor calls: MyClass(args) also connects to __init__ params
-                # because the call site writes to class_id.param_i but __init__'s
-                # bridge reads from method_id.param_i
+                # Constructor calls also connect to __init__ params because the
+                # call site writes to class_id.param_i but __init__'s bridge
+                # reads from method_id.param_i
                 init_id = self.symbol_index.get(f"{callee_name}.__init__")
                 if init_id:
-                    for i, arg in enumerate(node.args):
-                        arg_ns = _resolve_expr(arg, self._current_ns, self.symbol_index)
+                    for i, arg_ns in enumerate(arg_nses):
                         if arg_ns:
                             self.ag.add_edge(f"{init_id}.param_{i}", arg_ns)
 
@@ -703,7 +697,7 @@ class _CallResolver:
                             reason=reason,
                         )
                     )
-                    stats.unresolved_by_reason[reason] = stats.unresolved_by_reason.get(reason, 0) + 1
+                    stats.unresolved_by_reason[reason] += 1
 
         return CallResolutionResult(relationships=relationships, unresolved=unresolved, stats=stats)
 
@@ -722,35 +716,21 @@ class _CallResolver:
 
         obj_name, attr_name = site.callee_name.rsplit(".", 1)
 
-        # Strategy 3: super().method() → resolve to parent class method via MRO
         if obj_name == "super":
             return self._resolve_super_call(site, attr_name)
 
+        # Direct AG lookup for the full object path
         obj_ns = f"{site.caller_ns}.{obj_name}"
-
-        # Strategy 2a: Direct AG lookup for the full object path
         for pointee in self._ag.get_pointees(obj_ns):
             resolved = self._try_class_method(pointee, attr_name)
             if resolved:
                 return resolved
 
-        # Strategy 2b: Step-by-step resolution for dotted objects (e.g., self._conn.send)
+        # Step-by-step for dotted objects (e.g., self._conn.send)
         if "." in obj_name:
-            parts = obj_name.split(".")
-            current_ns = f"{site.caller_ns}.{parts[0]}"
-            for part in parts[1:]:
-                pointees = self._ag.get_pointees(current_ns)
-                resolved_next = False
-                for pointee in pointees:
-                    info = self._id_to_info.get(pointee)
-                    if info and info[0] == SymbolKind.CLASS:
-                        current_ns = f"{pointee}.{part}"
-                        resolved_next = True
-                        break
-                if not resolved_next:
-                    break
-            else:
-                for pointee in self._ag.get_pointees(current_ns):
+            final_ns = self._walk_dotted_object(site.caller_ns, obj_name)
+            if final_ns:
+                for pointee in self._ag.get_pointees(final_ns):
                     resolved = self._try_class_method(pointee, attr_name)
                     if resolved:
                         return resolved
@@ -844,31 +824,38 @@ class _CallResolver:
         """Check if an object name resolves to a repo symbol via the AG."""
         obj_ns = f"{caller_ns}.{obj_name}"
 
-        # Direct AG check (works for simple variables like my_obj)
+        # Direct AG check
         for pointee in self._ag.get_pointees(obj_ns):
             if pointee in self._id_to_info:
                 return True
 
-        # Step-by-step for dotted objects (self.attr, self.attr.sub)
+        # Step-by-step for dotted objects
         if "." in obj_name:
-            parts = obj_name.split(".")
-            current_ns = f"{caller_ns}.{parts[0]}"
-            for part in parts[1:]:
-                found_class = False
-                for pointee in self._ag.get_pointees(current_ns):
-                    info = self._id_to_info.get(pointee)
-                    if info and info[0] == SymbolKind.CLASS:
-                        current_ns = f"{pointee}.{part}"
-                        found_class = True
-                        break
-                if not found_class:
-                    return False
-            # Final attribute — check if it resolves to a repo symbol
-            for pointee in self._ag.get_pointees(current_ns):
-                if pointee in self._id_to_info:
-                    return True
+            final_ns = self._walk_dotted_object(caller_ns, obj_name)
+            if final_ns:
+                for pointee in self._ag.get_pointees(final_ns):
+                    if pointee in self._id_to_info:
+                        return True
 
         return False
+
+    def _walk_dotted_object(self, caller_ns: str, obj_name: str) -> str | None:
+        """Walk a dotted object path (e.g., "self._conn") through the AG step-by-step.
+
+        Returns the final namespace after resolving each segment through
+        class-level attributes. Returns None if any segment fails to resolve.
+        """
+        parts = obj_name.split(".")
+        current_ns = f"{caller_ns}.{parts[0]}"
+        for part in parts[1:]:
+            for pointee in self._ag.get_pointees(current_ns):
+                info = self._id_to_info.get(pointee)
+                if info and info[0] == SymbolKind.CLASS:
+                    current_ns = f"{pointee}.{part}"
+                    break
+            else:
+                return None
+        return current_ns
 
     def _classify_super_call(self, site: _CallSite) -> CallReason:
         """Classify a super().method() call: internal if any parent is a repo class."""
