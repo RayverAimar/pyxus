@@ -94,6 +94,26 @@ class TestAssignmentGraph:
         pointees = ag.get_pointees("a")
         assert isinstance(pointees, set)
 
+    def test_get_pointees_depth_boundary(self):
+        """Nodes at max_depth should be included, not silently discarded."""
+        ag = AssignmentGraph()
+        ag.add_edge("a", "b")
+        ag.add_edge("b", "c")
+        ag.add_edge("c", "d")
+        # max_depth=2: a→b (depth 1), b→c (depth 2), c→d would be depth 3
+        pointees = ag.get_pointees("a", max_depth=2)
+        assert "c" in pointees  # at the boundary — must be included
+
+    def test_get_pointees_deep_chain(self):
+        """A chain deeper than max_depth still returns the boundary nodes."""
+        ag = AssignmentGraph()
+        for i in range(20):
+            ag.add_edge(f"n{i}", f"n{i + 1}")
+        pointees = ag.get_pointees("n0", max_depth=5)
+        assert len(pointees) > 0
+        # Should reach at least n5 (the boundary)
+        assert "n5" in pointees
+
     def test_edge_count(self):
         ag = AssignmentGraph()
         ag.add_edge("a", "b")
@@ -291,30 +311,20 @@ class TestCrossMethodSelfAttr:
         assert "process" in _extract_resolved_names(result)
 
 
-class TestCoverageStats:
+class TestResolutionStats:
     def test_stats_counted(self):
-        code = (
-            "class Foo:\n"
-            "    def bar(self):\n"
-            "        pass\n"
-            "\n"
-            "Foo.bar()\n"
-            "unknown.bar()\n"  # unknown doesn't resolve to a repo class → external
-        )
+        code = "class Foo:\n    def bar(self):\n        pass\n\nFoo.bar()\nunknown.bar()\n"
         result = _make_call_resolution({"test.py": code})
         assert result.stats.total_calls >= 2
         assert result.stats.resolved >= 1
         assert result.stats.external >= 1
 
+
+class TestClassification:
     def test_unknown_object_classified_as_external(self):
         """A call on an unknown object is external — even if the method name
         exists in the repo. Classification is based on the OBJECT, not the method."""
-        code = (
-            "class Svc:\n"
-            "    def run(self): pass\n"
-            "\n"
-            "unknown_obj.run()\n"  # 'run' exists in repo but unknown_obj has no type info
-        )
+        code = "class Svc:\n    def run(self): pass\n\nunknown_obj.run()\n"
         result = _make_call_resolution({"test.py": code})
         assert result.stats.external >= 1
         assert len(result.unresolved) == 0
@@ -341,7 +351,6 @@ class TestCoverageStats:
             "        self._command.execute()\n"
         )
         result = _make_call_resolution({"test.py": code})
-        # _command resolves to Command via AG → execute should resolve
         targets = _extract_resolved_names(result)
         assert "execute" in targets
 
