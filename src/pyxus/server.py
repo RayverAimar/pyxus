@@ -21,6 +21,7 @@ from fastmcp import FastMCP
 from pyxus.graph.persistence import get_index_metadata, load_graph
 from pyxus.graph.queries import context as _context
 from pyxus.graph.queries import impact as _impact
+from pyxus.graph.queries import imports as _imports
 from pyxus.graph.queries import query as _query
 from pyxus.graph.store import GraphStore
 
@@ -106,6 +107,20 @@ def search(query_str: str, limit: int = 10) -> str:
     if graph is None:
         return _no_index_error()
     result = _query(graph, query_str, limit=limit)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def imports() -> str:
+    """Analyze module-level import dependencies and detect circular imports.
+
+    Returns the dependency graph between modules, circular import chains,
+    and per-module import/imported-by counts.
+    """
+    graph = _get_graph()
+    if graph is None:
+        return _no_index_error()
+    result = _imports(graph)
     return json.dumps(result, indent=2)
 
 

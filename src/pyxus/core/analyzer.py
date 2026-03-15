@@ -56,6 +56,39 @@ class AnalysisResult:
     call_resolution: CallResolutionResult | None = None
 
 
+def analyze_imports(repo_path: str) -> AnalysisResult:
+    """Run a lightweight import-only analysis on a Python repository.
+
+    Skips class hierarchy and call resolution — only builds the module
+    dependency graph. Useful for detecting circular imports, understanding
+    module coupling, and visualizing project structure.
+    """
+    start_time = time.monotonic()
+    stats = AnalysisStats()
+    graph = GraphStore()
+
+    files = _phase_walk(repo_path, stats)
+    if not files:
+        stats.duration_seconds = time.monotonic() - start_time
+        return AnalysisResult(graph=graph, stats=stats)
+
+    indexed_files = _phase_extract(files, graph, stats)
+    _phase_imports(indexed_files, graph, stats)
+
+    save_graph(
+        graph,
+        repo_path,
+        extra_metadata={
+            "files_indexed": stats.files_indexed,
+            "mode": "imports",
+        },
+    )
+
+    stats.duration_seconds = time.monotonic() - start_time
+    logger.info("Import analysis complete in %.1fs", stats.duration_seconds)
+    return AnalysisResult(graph=graph, stats=stats)
+
+
 def analyze(repo_path: str, incremental: bool = False) -> AnalysisResult:
     """Run the full analysis pipeline on a Python repository.
 

@@ -17,7 +17,7 @@ from typing import Any
 from pyxus.graph.models import RelationKind, Relationship, RiskLevel, Symbol, SymbolKind
 from pyxus.graph.store import GraphStore
 
-__all__ = ["context", "impact", "query"]
+__all__ = ["context", "impact", "imports", "query"]
 
 
 # ── Risk assessment thresholds ────────────────────────────────────────────
@@ -207,6 +207,83 @@ def query(graph: GraphStore, search: str, limit: int = 10) -> dict[str, Any]:
         "total_matches": len(scored),
         "results": results,
     }
+
+
+def imports(graph: GraphStore) -> dict[str, Any]:
+    """Analyze module-level import dependencies.
+
+    Returns the dependency graph between modules and detects circular imports
+    using DFS cycle detection on the IMPORTS relationship edges.
+    """
+    # Build module dependency adjacency: source_file → set of target_files
+    dependencies: dict[str, set[str]] = defaultdict(set)
+    module_symbols: dict[str, str] = {}  # file_path → module symbol name
+
+    for symbol in graph.symbols():
+        if symbol.kind == SymbolKind.MODULE:
+            module_symbols[symbol.file_path] = symbol.name
+
+    for symbol in graph.symbols():
+        if symbol.kind == SymbolKind.MODULE:
+            for target_sym, rel in graph.successors(symbol.id):
+                if rel.kind == RelationKind.IMPORTS and target_sym.kind == SymbolKind.MODULE:
+                    dependencies[symbol.file_path].add(target_sym.file_path)
+
+    # Detect circular imports via DFS
+    cycles = _find_import_cycles(dependencies)
+
+    # Build per-module stats
+    modules = []
+    for file_path, name in sorted(module_symbols.items()):
+        outgoing = dependencies.get(file_path, set())
+        incoming = {src for src, targets in dependencies.items() if file_path in targets}
+        modules.append(
+            {
+                "file": file_path,
+                "name": name,
+                "imports": len(outgoing),
+                "imported_by": len(incoming),
+            }
+        )
+
+    return {
+        "total_modules": len(module_symbols),
+        "total_dependencies": sum(len(targets) for targets in dependencies.values()),
+        "circular_imports": [[module_symbols.get(f, f) for f in cycle] for cycle in cycles],
+        "modules": modules,
+    }
+
+
+def _find_import_cycles(dependencies: dict[str, set[str]]) -> list[list[str]]:
+    """Find all circular import chains using recursive DFS with back-edge detection."""
+    cycles: list[list[str]] = []
+    visited: set[str] = set()
+
+    def _dfs(node: str, path: list[str], path_set: set[str]) -> None:
+        if node in path_set:
+            cycle_start = path.index(node)
+            cycle = path[cycle_start:]
+            # Normalize: start from the lexicographically smallest node
+            min_idx = cycle.index(min(cycle))
+            normalized = cycle[min_idx:] + cycle[:min_idx]
+            if normalized not in cycles:
+                cycles.append(normalized)
+            return
+        if node in visited:
+            return
+        visited.add(node)
+        path_set.add(node)
+        path.append(node)
+        for neighbor in dependencies.get(node, set()):
+            _dfs(neighbor, path, path_set)
+        path.pop()
+        path_set.discard(node)
+
+    for start in dependencies:
+        if start not in visited:
+            _dfs(start, [], set())
+
+    return cycles
 
 
 # ── Private helpers ───────────────────────────────────────────────────────

@@ -3,7 +3,7 @@
 import pytest
 
 from pyxus.graph.models import RelationKind, Relationship, RiskLevel, Symbol, SymbolKind
-from pyxus.graph.queries import context, impact, query
+from pyxus.graph.queries import context, impact, imports, query
 from pyxus.graph.store import GraphStore
 
 
@@ -236,6 +236,88 @@ class TestImpactEdgeCases:
         result = impact(graph_with_service, "create")
         assert result.get("disambiguation") is True
         assert len(result["candidates"]) >= 2
+
+
+class TestImports:
+    def test_module_dependencies(self):
+        """Import relationships are reported as module dependencies."""
+        g = GraphStore()
+        mod_a = Symbol(
+            id="module:a.py:a.py:0",
+            name="a.py",
+            kind=SymbolKind.MODULE,
+            file_path="a.py",
+            start_line=0,
+            end_line=0,
+        )
+        mod_b = Symbol(
+            id="module:b.py:b.py:0",
+            name="b.py",
+            kind=SymbolKind.MODULE,
+            file_path="b.py",
+            start_line=0,
+            end_line=0,
+        )
+        g.add_symbol(mod_a)
+        g.add_symbol(mod_b)
+        g.add_relationship(
+            Relationship(
+                id="r1",
+                source_id=mod_a.id,
+                target_id=mod_b.id,
+                kind=RelationKind.IMPORTS,
+            )
+        )
+        result = imports(g)
+        assert result["total_modules"] == 2
+        assert result["total_dependencies"] == 1
+        assert result["circular_imports"] == []
+
+    def test_circular_import_detected(self):
+        """A → B → A is reported as a circular import."""
+        g = GraphStore()
+        mod_a = Symbol(
+            id="module:a.py:a.py:0",
+            name="a.py",
+            kind=SymbolKind.MODULE,
+            file_path="a.py",
+            start_line=0,
+            end_line=0,
+        )
+        mod_b = Symbol(
+            id="module:b.py:b.py:0",
+            name="b.py",
+            kind=SymbolKind.MODULE,
+            file_path="b.py",
+            start_line=0,
+            end_line=0,
+        )
+        g.add_symbol(mod_a)
+        g.add_symbol(mod_b)
+        g.add_relationship(
+            Relationship(
+                id="r1",
+                source_id=mod_a.id,
+                target_id=mod_b.id,
+                kind=RelationKind.IMPORTS,
+            )
+        )
+        g.add_relationship(
+            Relationship(
+                id="r2",
+                source_id=mod_b.id,
+                target_id=mod_a.id,
+                kind=RelationKind.IMPORTS,
+            )
+        )
+        result = imports(g)
+        assert len(result["circular_imports"]) >= 1
+
+    def test_no_modules_returns_empty(self):
+        g = GraphStore()
+        result = imports(g)
+        assert result["total_modules"] == 0
+        assert result["circular_imports"] == []
 
 
 class TestRiskThresholds:

@@ -101,6 +101,43 @@ def status(path: str) -> None:
         click.echo(f"  Call resolution:   {rate:.1f}%")
 
 
+@main.command(name="imports")
+@click.argument("path", default=".", type=click.Path(exists=True))
+def imports_cmd(path: str) -> None:
+    """Analyze import dependencies and detect circular imports."""
+    logging.basicConfig(level=logging.INFO, format="  %(message)s")
+
+    # Deferred: avoids importing the full analysis pipeline on CLI startup
+    from pyxus.core.analyzer import analyze_imports
+    from pyxus.graph.queries import imports as query_imports
+
+    repo_path = str(Path(path).resolve())
+    click.echo(f"Pyxus v{__version__} — import analysis of {repo_path}\n")
+
+    result = analyze_imports(repo_path)
+    stats = result.stats
+
+    click.echo(f"  Files: {stats.files_indexed} indexed")
+    click.echo(f"  Symbols: {stats.symbols_extracted}")
+    click.echo(f"  Imports: {stats.imports_resolved} resolved, {stats.imports_unresolved} unresolved")
+
+    # Run import dependency analysis
+    import_data = query_imports(result.graph)
+
+    click.echo(f"\n  Modules: {import_data['total_modules']}")
+    click.echo(f"  Dependencies: {import_data['total_dependencies']}")
+
+    cycles = import_data["circular_imports"]
+    if cycles:
+        click.echo(f"\n  Circular imports detected: {len(cycles)}")
+        for cycle in cycles:
+            click.echo(f"    {' → '.join(cycle)} → {cycle[0]}")
+    else:
+        click.echo("\n  No circular imports detected")
+
+    click.echo(f"\n  Analysis complete ({stats.duration_seconds:.1f}s)")
+
+
 @main.command()
 @click.argument("path", default=".", type=click.Path(exists=True))
 def clean(path: str) -> None:
