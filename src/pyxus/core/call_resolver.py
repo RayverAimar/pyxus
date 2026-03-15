@@ -464,16 +464,24 @@ class _AssignmentCollector(_NamespaceTrackingVisitor):
         self.call_sites: list[_CallSite] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        # All parameters: posonlyargs come before regular args in Python 3.8+
+        all_params = node.args.posonlyargs + node.args.args
+
         self._ns_stack.append(node.name)
 
         class_name = self._enclosing_class_name
-        is_method = bool(class_name and class_name in self.symbol_index and node.args.args)
+        is_method = bool(class_name and class_name in self.symbol_index and all_params)
 
         # Seed self/cls parameter with the enclosing class (not for closures)
         if is_method:
-            first_param = node.args.args[0].arg
+            first_param = all_params[0].arg
             param_ns = f"{self._current_ns}.{first_param}"
             self.ag.add_edge(param_ns, self.symbol_index[class_name])
+        elif class_name and class_name in self.symbol_index:
+            # Nested function inside a method: propagate self from enclosing scope
+            # so that closures capturing self can resolve self.method()
+            parent_ns = ".".join(self._ns_stack[:-1])
+            self.ag.add_edge(f"{self._current_ns}.self", f"{parent_ns}.self")
 
         # Bridge the two namespace systems: the AST visitor uses module-path
         # namespaces (e.g., "test.process.obj") but call sites use symbol-ID
@@ -487,7 +495,7 @@ class _AssignmentCollector(_NamespaceTrackingVisitor):
             # Params: module-path.param_name → symbol-ID.param_i
             # For methods, skip self/cls (index 0) — call sites don't include it
             param_offset = 1 if is_method else 0
-            for i, arg in enumerate(node.args.args[param_offset:]):
+            for i, arg in enumerate(all_params[param_offset:]):
                 self.ag.add_edge(f"{self._current_ns}.{arg.arg}", f"{func_id}.param_{i}")
 
         self.generic_visit(node)

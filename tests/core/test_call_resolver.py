@@ -164,6 +164,28 @@ class TestSelfMethodCall:
         # Both files should resolve self.close()
         assert result.stats.resolved >= 2
 
+    def test_self_in_nested_function(self):
+        """self captured by a closure inside a method should still resolve."""
+        code = (
+            "class Checker:\n"
+            "    def check(self):\n"
+            "        def helper():\n"
+            "            self.report()\n"
+            "        helper()\n"
+            "    def report(self):\n"
+            "        pass\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "report" in targets
+
+    def test_posonlyargs_self(self):
+        """self as positional-only parameter should still be seeded."""
+        code = "class Ctx:\n    def invoke(self, callback, /):\n        self.run()\n    def run(self):\n        pass\n"
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "run" in targets
+
     def test_same_class_name_different_files_no_cross_contamination(self):
         """Two classes named Connection in different files must resolve
         self.method() to their OWN methods, not cross-file."""
