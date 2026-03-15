@@ -118,6 +118,53 @@ class TestSelfMethodCall:
         assert result.stats.resolved >= 1
         assert "baz" in _extract_resolved_names(result)
 
+    def test_self_method_with_ambiguous_method_name(self):
+        """When method names collide across classes (sync/async mirrors),
+        self.method() must still resolve via per-file class seeding."""
+        result = _make_call_resolution(
+            {
+                "sync.py": (
+                    "class SyncConn:\n    def close(self):\n        pass\n    def send(self):\n        self.close()\n"
+                ),
+                "async_.py": (
+                    "class AsyncConn:\n"
+                    "    async def close(self):\n"
+                    "        pass\n"
+                    "    async def send(self):\n"
+                    "        self.close()\n"
+                ),
+            }
+        )
+        targets = _extract_resolved_names(result)
+        assert "close" in targets
+        # Both files should resolve self.close()
+        assert result.stats.resolved >= 2
+
+    def test_same_class_name_different_files_no_cross_contamination(self):
+        """Two classes named Connection in different files must resolve
+        self.method() to their OWN methods, not cross-file."""
+        result = _make_call_resolution(
+            {
+                "sync.py": (
+                    "class Connection:\n    def close(self): pass\n    def send(self):\n        self.close()\n"
+                ),
+                "async_.py": (
+                    "class Connection:\n"
+                    "    async def close(self): pass\n"
+                    "    async def send(self):\n"
+                    "        self.close()\n"
+                ),
+            }
+        )
+        # Both should resolve — each to their own file's close()
+        assert result.stats.resolved >= 2
+        # Verify no cross-file edges: each relationship's source and target
+        # must share the same file_path prefix in their symbol IDs
+        for rel in result.relationships:
+            source_file = rel.source_id.split(":")[1]
+            target_file = rel.target_id.split(":")[1]
+            assert source_file == target_file, f"Cross-file edge detected: {rel.source_id} -> {rel.target_id}"
+
 
 class TestInterproceduralCall:
     def test_parameter_propagation(self):
@@ -136,9 +183,30 @@ class TestInterproceduralCall:
         )
         result = _make_call_resolution({"test.py": code})
         assert result.stats.total_calls >= 2
-        # The inter-procedural case: process(service) should connect obj → MyService
         targets = _extract_resolved_names(result)
-        assert "MyService" in targets or "execute" in targets
+        # Both must resolve: MyService() constructor AND obj.execute() via param propagation
+        assert "MyService" in targets
+        assert "execute" in targets
+
+    def test_parameter_propagation_multiple_params(self):
+        """Multiple parameters should each resolve independently."""
+        code = (
+            "class DB:\n"
+            "    def query(self): pass\n"
+            "\n"
+            "class Cache:\n"
+            "    def get(self): pass\n"
+            "\n"
+            "def handler(db, cache):\n"
+            "    db.query()\n"
+            "    cache.get()\n"
+            "\n"
+            "handler(DB(), Cache())\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "query" in targets
+        assert "get" in targets
 
 
 class TestConstructorReturn:
@@ -219,6 +287,7 @@ class TestCoverageStats:
 
 class TestReturnTypePropagation:
     def test_return_value_tracked(self):
+        """s = get_service(); s.process() should resolve process via return type."""
         code = (
             "class Service:\n"
             "    def process(self):\n"
@@ -231,9 +300,49 @@ class TestReturnTypePropagation:
             "s.process()\n"
         )
         result = _make_call_resolution({"test.py": code})
-        assert result.stats.total_calls >= 2
         targets = _extract_resolved_names(result)
-        assert "get_service" in targets or "Service" in targets
+        # All three calls must resolve: get_service(), Service() constructor, s.process()
+        assert "get_service" in targets
+        assert "process" in targets
+
+    def test_factory_chain(self):
+        """Factory returning another factory's result should chain correctly."""
+        code = (
+            "class Conn:\n"
+            "    def execute(self): pass\n"
+            "\n"
+            "def create_conn():\n"
+            "    return Conn()\n"
+            "\n"
+            "def get_conn():\n"
+            "    return create_conn()\n"
+            "\n"
+            "c = get_conn()\n"
+            "c.execute()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "execute" in targets
+
+    def test_method_return_value(self):
+        """Return from a method (not just standalone function) should propagate."""
+        code = (
+            "class Conn:\n"
+            "    def close(self): pass\n"
+            "\n"
+            "class Pool:\n"
+            "    def get_conn(self):\n"
+            "        return Conn()\n"
+            "\n"
+            "def main():\n"
+            "    pool = Pool()\n"
+            "    c = pool.get_conn()\n"
+            "    c.close()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "get_conn" in targets
+        assert "close" in targets
 
 
 class TestEdgeCases:
@@ -275,7 +384,9 @@ class TestEdgeCases:
         code = "class Svc:\n    def run(self):\n        pass\n\ndef main():\n    s = Svc()\n    s.run()\n"
         result = _make_call_resolution({"test.py": code})
         assert result.stats.total_calls >= 2
-        assert "run" in _extract_resolved_names(result) or "Svc" in _extract_resolved_names(result)
+        targets = _extract_resolved_names(result)
+        assert "Svc" in targets
+        assert "run" in targets
 
     def test_multiple_files(self):
         result = _make_call_resolution(
