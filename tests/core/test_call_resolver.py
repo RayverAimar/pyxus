@@ -335,11 +335,16 @@ class TestCoverageStats:
         targets = _extract_resolved_names(result)
         assert "execute" in targets
 
-    def test_super_classified_as_internal(self):
-        """super().__init__() that can't resolve should be unresolved_internal, not external."""
+    def test_super_with_external_base_classified_as_external(self):
+        """super().__init__() where all bases are external → EXTERNAL."""
         code = "class Child(UnknownBase):\n    def __init__(self):\n        super().__init__()\n"
         result = _make_call_resolution({"test.py": code})
-        # super().__init__() → internal (super() itself is a builtin → external)
+        assert result.stats.external >= 1
+
+    def test_super_with_repo_base_classified_as_internal(self):
+        """super().method() where parent is a repo class but method doesn't exist → INTERNAL."""
+        code = "class Base:\n    pass\n\nclass Child(Base):\n    def run(self):\n        super().nonexistent()\n"
+        result = _make_call_resolution({"test.py": code})
         assert len(result.unresolved) >= 1
         assert result.unresolved[0].reason == CallReason.UNRESOLVED_INTERNAL
 

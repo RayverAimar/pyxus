@@ -652,6 +652,12 @@ class _CallResolver:
         self._id_to_info = id_to_info
         self._module_ns_index = module_ns_index
         self._hierarchy = hierarchy
+        # (file_path, class_name) → class_symbol_id for file-aware class lookup
+        self._file_class_index: dict[tuple[str, str], str] = {}
+        for sym_id, info in id_to_info.items():
+            if info[0] == SymbolKind.CLASS:
+                file_path = sym_id.split(":")[1]
+                self._file_class_index[(file_path, info[1])] = sym_id
 
     def extract_call_edges(self, call_sites: list[_CallSite]) -> CallResolutionResult:
         """Convert resolved call sites into CALLS relationships."""
@@ -710,7 +716,7 @@ class _CallResolver:
 
         # Strategy 3: super().method() → resolve to parent class method via MRO
         if obj_name == "super":
-            return self._resolve_super_call(site.caller_ns, attr_name)
+            return self._resolve_super_call(site, attr_name)
 
         obj_ns = f"{site.caller_ns}.{obj_name}"
 
@@ -743,24 +749,26 @@ class _CallResolver:
 
         return None
 
-    def _resolve_super_call(self, caller_ns: str, method_name: str) -> str | None:
+    def _resolve_super_call(self, site: _CallSite, method_name: str) -> str | None:
         """Resolve super().method() to the parent class method via MRO."""
-        # Find the enclosing class from the namespace (e.g., "mod.MyClass.method" → "MyClass")
-        parts = caller_ns.split(".")
+        class_id = self._find_enclosing_class(site)
+        if not class_id:
+            return None
+        # Walk MRO starting from index 1 (skip self, start at parent)
+        mro = self._hierarchy.get_mro(class_id)
+        for parent_id in mro[1:]:
+            result = f"{parent_id}.{method_name}"
+            if result in self._symbol_index:
+                return self._symbol_index[result]
+        return None
+
+    def _find_enclosing_class(self, site: _CallSite) -> str | None:
+        """Find the class symbol ID that encloses a call site, using file context."""
+        parts = site.caller_ns.split(".")
         for i in range(len(parts) - 1, 0, -1):
-            class_name = parts[i]
-            # Try to find the class in the symbol index
-            class_id = self._symbol_index.get(class_name)
-            if class_id and class_id in self._id_to_info:
-                info = self._id_to_info[class_id]
-                if info[0] == SymbolKind.CLASS:
-                    # Walk MRO starting from index 1 (skip self, start at parent)
-                    mro = self._hierarchy.get_mro(class_id)
-                    for parent_id in mro[1:]:
-                        result = f"{parent_id}.{method_name}"
-                        if result in self._symbol_index:
-                            return self._symbol_index[result]
-                    return None
+            class_id = self._file_class_index.get((site.file_path, parts[i]))
+            if class_id:
+                return class_id
         return None
 
     def _try_class_method(self, pointee: str, method_name: str) -> str | None:
@@ -815,9 +823,9 @@ class _CallResolver:
 
         obj_name, _ = callee.rsplit(".", 1)
 
-        # super() is always internal
+        # super().method(): internal only if a parent class in the repo defines methods
         if obj_name == "super":
-            return CallReason.UNRESOLVED_INTERNAL
+            return self._classify_super_call(site)
 
         if self._object_resolves_to_repo(site.caller_ns, obj_name):
             return CallReason.UNRESOLVED_INTERNAL
@@ -853,6 +861,19 @@ class _CallResolver:
                     return True
 
         return False
+
+    def _classify_super_call(self, site: _CallSite) -> CallReason:
+        """Classify a super().method() call: internal if any parent is a repo class."""
+        class_id = self._find_enclosing_class(site)
+        if not class_id:
+            return CallReason.EXTERNAL
+        mro = self._hierarchy.get_mro(class_id)
+        # If any parent (skip self at index 0) is a repo class, it's internal
+        for parent_id in mro[1:]:
+            if parent_id in self._id_to_info:
+                return CallReason.UNRESOLVED_INTERNAL
+        # All parents are external (stdlib, third-party) → external
+        return CallReason.EXTERNAL
 
     def _find_enclosing_symbol(self, namespace: str) -> str | None:
         """Find the symbol ID of the function/method that contains a given namespace."""
