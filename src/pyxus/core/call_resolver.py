@@ -548,8 +548,17 @@ class _AssignmentCollector(_NamespaceTrackingVisitor):
                 for i, arg in enumerate(node.args):
                     arg_ns = _resolve_expr(arg, self._current_ns, self.symbol_index)
                     if arg_ns:
-                        param_ns = f"{callee_id}.param_{i}"
-                        self.ag.add_edge(param_ns, arg_ns)
+                        self.ag.add_edge(f"{callee_id}.param_{i}", arg_ns)
+
+                # Constructor calls: MyClass(args) also connects to __init__ params
+                # because the call site writes to class_id.param_i but __init__'s
+                # bridge reads from method_id.param_i
+                init_id = self.symbol_index.get(f"{callee_name}.__init__")
+                if init_id:
+                    for i, arg in enumerate(node.args):
+                        arg_ns = _resolve_expr(arg, self._current_ns, self.symbol_index)
+                        if arg_ns:
+                            self.ag.add_edge(f"{init_id}.param_{i}", arg_ns)
 
         self.generic_visit(node)
 
@@ -689,6 +698,7 @@ class _CallResolver:
 
         Strategy 1: Direct name match in the symbol index.
         Strategy 2: Follow the assignment graph for variable-based calls.
+        Strategy 3: super().method() → resolve via MRO of enclosing class.
         """
         if site.callee_name in self._symbol_index:
             return self._symbol_index[site.callee_name]
@@ -697,6 +707,11 @@ class _CallResolver:
             return None
 
         obj_name, attr_name = site.callee_name.rsplit(".", 1)
+
+        # Strategy 3: super().method() → resolve to parent class method via MRO
+        if obj_name == "super":
+            return self._resolve_super_call(site.caller_ns, attr_name)
+
         obj_ns = f"{site.caller_ns}.{obj_name}"
 
         # Strategy 2a: Direct AG lookup for the full object path
@@ -728,8 +743,32 @@ class _CallResolver:
 
         return None
 
+    def _resolve_super_call(self, caller_ns: str, method_name: str) -> str | None:
+        """Resolve super().method() to the parent class method via MRO."""
+        # Find the enclosing class from the namespace (e.g., "mod.MyClass.method" → "MyClass")
+        parts = caller_ns.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            class_name = parts[i]
+            # Try to find the class in the symbol index
+            class_id = self._symbol_index.get(class_name)
+            if class_id and class_id in self._id_to_info:
+                info = self._id_to_info[class_id]
+                if info[0] == SymbolKind.CLASS:
+                    # Walk MRO starting from index 1 (skip self, start at parent)
+                    mro = self._hierarchy.get_mro(class_id)
+                    for parent_id in mro[1:]:
+                        result = f"{parent_id}.{method_name}"
+                        if result in self._symbol_index:
+                            return self._symbol_index[result]
+                    return None
+        return None
+
     def _try_class_method(self, pointee: str, method_name: str) -> str | None:
-        """If pointee is a CLASS, look up its method — walking the MRO if needed."""
+        """If pointee is a CLASS, look up its method — walking the MRO if needed.
+
+        Also handles callable attributes: when self.x = some_func is stored
+        in __init__, follows the AG edge to resolve the stored callable.
+        """
         info = self._id_to_info.get(pointee)
         if not info or info[0] != SymbolKind.CLASS:
             return None
@@ -750,6 +789,14 @@ class _CallResolver:
             inherited = f"{owner_id}.{method_name}"
             if inherited in self._symbol_index:
                 return self._symbol_index[inherited]
+
+        # Callable attribute: self.x = some_func stored via assignment.
+        # Follow the AG edge from {class_id}.{attr} to find the callable.
+        for attr_pointee in self._ag.get_pointees(id_qualified):
+            if attr_pointee in self._id_to_info:
+                attr_info = self._id_to_info[attr_pointee]
+                if attr_info[0] in (SymbolKind.FUNCTION, SymbolKind.CLASS):
+                    return attr_pointee
 
         return None
 

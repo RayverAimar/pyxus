@@ -439,6 +439,85 @@ class TestInheritedMethods:
         assert "save" in targets
 
 
+class TestSuperCalls:
+    def test_super_init(self):
+        """super().__init__() should resolve to the parent's __init__."""
+        code = (
+            "class Base:\n"
+            "    def __init__(self): pass\n"
+            "\n"
+            "class Child(Base):\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "__init__" in targets
+
+    def test_super_method(self):
+        """super().method() should resolve to the parent's method."""
+        code = (
+            "class Base:\n    def save(self): pass\n\nclass Child(Base):\n    def save(self):\n        super().save()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        # super().save() should resolve to Base.save
+        assert result.stats.resolved >= 1
+
+    def test_super_deep_hierarchy(self):
+        """super() in C should resolve to B's method, not A's."""
+        code = (
+            "class A:\n"
+            "    def run(self): pass\n"
+            "\n"
+            "class B(A):\n"
+            "    def run(self): pass\n"
+            "\n"
+            "class C(B):\n"
+            "    def run(self):\n"
+            "        super().run()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        assert result.stats.resolved >= 1
+
+
+class TestCallableAttributes:
+    def test_stored_function(self):
+        """self.func = some_function stored as attribute, then called."""
+        code = (
+            "def my_strategy(x):\n"
+            "    return x * 2\n"
+            "\n"
+            "class Order:\n"
+            "    def __init__(self, strategy):\n"
+            "        self.strategy = strategy\n"
+            "    def apply(self):\n"
+            "        self.strategy(self)\n"
+            "\n"
+            "Order(my_strategy)\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "my_strategy" in targets
+
+    def test_stored_class_as_factory(self):
+        """self.factory = SomeClass stored as attribute, then called as factory."""
+        code = (
+            "class Dog:\n"
+            "    def __init__(self, name): pass\n"
+            "\n"
+            "class Shop:\n"
+            "    def __init__(self, factory):\n"
+            "        self.factory = factory\n"
+            "    def create(self):\n"
+            "        self.factory('Rex')\n"
+            "\n"
+            "Shop(Dog)\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "Dog" in targets
+
+
 class TestEdgeCases:
     def test_syntax_error_handled(self):
         result = _make_call_resolution({"bad.py": "def broken(:\n"})
