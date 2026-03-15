@@ -14,8 +14,6 @@ The algorithm:
    - [ATTR]   ``o.x`` → resolve x through class hierarchy of o's type
    - [RETURN] ``return expr`` → connect to caller's assignment target
 3. Extract CALLS edges from the final assignment graph.
-
-Achieves ~70% call resolution without type hints on typical Python codebases.
 """
 
 from __future__ import annotations
@@ -143,6 +141,9 @@ class AssignmentGraph:
         return sum(len(targets) for targets in self._edges.values())
 
 
+# ── Public API ─────────────────────────────────────────────────────────
+
+
 def resolve_calls(
     files: list[SourceFile],
     graph: GraphStore,
@@ -155,9 +156,9 @@ def resolve_calls(
     ag = AssignmentGraph()
     symbol_index = _build_symbol_index(graph)
 
-    # symbol_id → (kind, name) for O(1) lookup in _resolve_callee
+    # symbol_id → (kind, name) for O(1) lookup during resolution
     id_to_info: dict[str, tuple[SymbolKind, str]] = {}
-    # module namespace → symbol_id for _find_enclosing_symbol
+    # module namespace → symbol_id for enclosing symbol lookup
     module_ns_index: dict[str, str] = {}
     for sym in graph.symbols():
         if sym.kind == SymbolKind.MODULE:
@@ -211,7 +212,11 @@ def resolve_calls(
         logger.warning("Assignment graph did not converge after %d iterations", MAX_ITERATIONS)
 
     # Phase 3: Extract CALLS edges from resolved call sites
-    return _extract_call_edges(call_sites, ag, symbol_index, id_to_info, module_ns_index)
+    resolver = _CallResolver(ag, symbol_index, id_to_info, module_ns_index, class_hierarchy)
+    return resolver.extract_call_edges(call_sites)
+
+
+# ── Index builders ─────────────────────────────────────────────────────
 
 
 def _build_symbol_index(graph: GraphStore) -> dict[str, str]:
@@ -224,7 +229,7 @@ def _build_symbol_index(graph: GraphStore) -> dict[str, str]:
 
     Name-based entries (bare and "ClassName.method") are pruned on collision
     to avoid wrong attribution. ID-based entries ("{class_id}.method") are
-    always unique and used by _try_class_method for AG-resolved calls.
+    always unique and used by the resolver for AG-resolved calls.
     """
     index: dict[str, str] = {}
     # Track names seen more than once to avoid wrong attribution
@@ -338,14 +343,11 @@ def _build_per_file_indexes(
     return result
 
 
-# ── AST helpers (using shared get_dotted_name from ast_utils) ─────────────
+# ── AST helpers ────────────────────────────────────────────────────────
 
 
 def _module_ns(file_path: str) -> str:
-    """Convert a file path to a module namespace string.
-
-    Handles both Unix (/) and Windows (\\) separators.
-    """
+    """Convert a file path to a module namespace string."""
     return file_path.replace("\\", ".").replace("/", ".").removesuffix(".py")
 
 
@@ -372,11 +374,7 @@ def _get_assign_target_name(node: ast.expr) -> str | None:
 
 
 def _resolve_expr(node: ast.expr, current_ns: str, symbol_index: dict[str, str]) -> str | None:
-    """Resolve an AST expression to a namespace string in the assignment graph.
-
-    Shared between _AssignmentCollector and _AssignmentPropagator to avoid
-    duplicating this logic.
-    """
+    """Resolve an AST expression to a namespace string in the assignment graph."""
     if isinstance(node, ast.Name):
         if node.id in symbol_index:
             return symbol_index[node.id]
@@ -395,7 +393,7 @@ def _resolve_expr(node: ast.expr, current_ns: str, symbol_index: dict[str, str])
     return None
 
 
-# ── Internal data ─────────────────────────────────────────────────────────
+# ── Internal data ──────────────────────────────────────────────────────
 
 
 @dataclass
@@ -409,7 +407,7 @@ class _CallSite:
     call_text: str
 
 
-# ── AST visitors ──────────────────────────────────────────────────────────
+# ── AST visitors ───────────────────────────────────────────────────────
 
 
 class _NamespaceTrackingVisitor(ast.NodeVisitor):
@@ -452,7 +450,6 @@ class _NamespaceTrackingVisitor(ast.NodeVisitor):
 
     def visit_For(self, node: ast.For) -> None:
         """Connect loop variable to iterable so `for x in items: x.method()` can resolve."""
-        # Subclasses that have `ag` and `symbol_index` will create the edge
         self.generic_visit(node)
 
 
@@ -623,188 +620,175 @@ class _AssignmentPropagator(_NamespaceTrackingVisitor):
         return None
 
 
-# ── Call edge extraction ──────────────────────────────────────────────────
+# ── Call resolution ────────────────────────────────────────────────────
 
 
-def _extract_call_edges(
-    call_sites: list[_CallSite],
-    ag: AssignmentGraph,
-    symbol_index: dict[str, str],
-    id_to_info: dict[str, tuple[SymbolKind, str]],
-    module_ns_index: dict[str, str],
-) -> CallResolutionResult:
-    """Convert resolved call sites into CALLS relationships."""
-    relationships: list[Relationship] = []
-    unresolved: list[UnresolvedCall] = []
-    stats = ResolutionStats(total_calls=len(call_sites))
-    seen_edges: set[tuple[str, str]] = set()
+class _CallResolver:
+    """Resolves call sites to target symbol IDs and classifies unresolved calls.
 
-    for site in call_sites:
-        callee_id = _resolve_callee(site, ag, symbol_index, id_to_info)
+    Encapsulates all resolution state (assignment graph, symbol indexes,
+    class hierarchy) to avoid passing 5+ parameters through every function.
+    """
 
-        if callee_id:
-            caller_id = _find_enclosing_symbol(site.caller_ns, symbol_index, module_ns_index)
-            if caller_id and (caller_id, callee_id) not in seen_edges:
-                seen_edges.add((caller_id, callee_id))
-                relationships.append(
-                    Relationship(
-                        id=make_relationship_id(caller_id, callee_id, RelationKind.CALLS),
-                        source_id=caller_id,
-                        target_id=callee_id,
-                        kind=RelationKind.CALLS,
+    def __init__(
+        self,
+        ag: AssignmentGraph,
+        symbol_index: dict[str, str],
+        id_to_info: dict[str, tuple[SymbolKind, str]],
+        module_ns_index: dict[str, str],
+        hierarchy: ClassHierarchy,
+    ) -> None:
+        self._ag = ag
+        self._symbol_index = symbol_index
+        self._id_to_info = id_to_info
+        self._module_ns_index = module_ns_index
+        self._hierarchy = hierarchy
+
+    def extract_call_edges(self, call_sites: list[_CallSite]) -> CallResolutionResult:
+        """Convert resolved call sites into CALLS relationships."""
+        relationships: list[Relationship] = []
+        unresolved: list[UnresolvedCall] = []
+        stats = ResolutionStats(total_calls=len(call_sites))
+        seen_edges: set[tuple[str, str]] = set()
+
+        for site in call_sites:
+            callee_id = self._resolve_callee(site)
+
+            if callee_id:
+                caller_id = self._find_enclosing_symbol(site.caller_ns)
+                if caller_id and (caller_id, callee_id) not in seen_edges:
+                    seen_edges.add((caller_id, callee_id))
+                    relationships.append(
+                        Relationship(
+                            id=make_relationship_id(caller_id, callee_id, RelationKind.CALLS),
+                            source_id=caller_id,
+                            target_id=callee_id,
+                            kind=RelationKind.CALLS,
+                        )
                     )
-                )
-                stats.resolved += 1
-        else:
-            reason = _classify_unresolved(site, ag, symbol_index, id_to_info)
-            if reason == CallReason.EXTERNAL:
-                stats.external += 1
+                    stats.resolved += 1
             else:
-                unresolved.append(
-                    UnresolvedCall(
-                        file_path=site.file_path,
-                        line=site.line,
-                        call_text=site.call_text,
-                        reason=reason,
+                reason = self._classify_unresolved(site)
+                if reason == CallReason.EXTERNAL:
+                    stats.external += 1
+                else:
+                    unresolved.append(
+                        UnresolvedCall(
+                            file_path=site.file_path,
+                            line=site.line,
+                            call_text=site.call_text,
+                            reason=reason,
+                        )
                     )
-                )
-                stats.unresolved_by_reason[reason] = stats.unresolved_by_reason.get(reason, 0) + 1
+                    stats.unresolved_by_reason[reason] = stats.unresolved_by_reason.get(reason, 0) + 1
 
-    return CallResolutionResult(relationships=relationships, unresolved=unresolved, stats=stats)
+        return CallResolutionResult(relationships=relationships, unresolved=unresolved, stats=stats)
 
+    def _resolve_callee(self, site: _CallSite) -> str | None:
+        """Try to resolve a call site to a target symbol ID.
 
-def _classify_unresolved(
-    site: _CallSite,
-    ag: AssignmentGraph,
-    symbol_index: dict[str, str],
-    id_to_info: dict[str, tuple[SymbolKind, str]],
-) -> CallReason:
-    """Classify an unresolved call as external or internal.
+        Strategy 1: Direct name match in the symbol index.
+        Strategy 2: Follow the assignment graph for variable-based calls.
+        """
+        if site.callee_name in self._symbol_index:
+            return self._symbol_index[site.callee_name]
 
-    For dotted calls (obj.method), checks whether the OBJECT resolves to
-    a repo class via the AG. A method name existing somewhere in the repo
-    is not sufficient — "close" exists in both repo classes and stdlib.
-    """
-    callee = site.callee_name
+        if "." not in site.callee_name:
+            return None
 
-    if "." not in callee:
-        return CallReason.UNRESOLVED_INTERNAL if callee in symbol_index else CallReason.EXTERNAL
+        obj_name, attr_name = site.callee_name.rsplit(".", 1)
+        obj_ns = f"{site.caller_ns}.{obj_name}"
 
-    obj_name, _ = callee.rsplit(".", 1)
-    obj_ns = f"{site.caller_ns}.{obj_name}"
+        # Strategy 2a: Direct AG lookup for the full object path
+        for pointee in self._ag.get_pointees(obj_ns):
+            resolved = self._try_class_method(pointee, attr_name)
+            if resolved:
+                return resolved
 
-    # Check if the object resolves to a repo class via the assignment graph
-    for pointee in ag.get_pointees(obj_ns):
-        if pointee in id_to_info:
-            return CallReason.UNRESOLVED_INTERNAL
+        # Strategy 2b: Step-by-step resolution for dotted objects (e.g., self._conn.send)
+        if "." in obj_name:
+            parts = obj_name.split(".")
+            current_ns = f"{site.caller_ns}.{parts[0]}"
+            for part in parts[1:]:
+                pointees = self._ag.get_pointees(current_ns)
+                resolved_next = False
+                for pointee in pointees:
+                    info = self._id_to_info.get(pointee)
+                    if info and info[0] == SymbolKind.CLASS:
+                        current_ns = f"{pointee}.{part}"
+                        resolved_next = True
+                        break
+                if not resolved_next:
+                    break
+            else:
+                for pointee in self._ag.get_pointees(current_ns):
+                    resolved = self._try_class_method(pointee, attr_name)
+                    if resolved:
+                        return resolved
 
-    return CallReason.EXTERNAL
-
-
-def _resolve_callee(
-    site: _CallSite,
-    ag: AssignmentGraph,
-    symbol_index: dict[str, str],
-    id_to_info: dict[str, tuple[SymbolKind, str]],
-) -> str | None:
-    """Try to resolve a call site to a target symbol ID.
-
-    Strategy 1: Direct name match in the symbol index.
-    Strategy 2: Follow the assignment graph for variable-based calls.
-    """
-    if site.callee_name in symbol_index:
-        return symbol_index[site.callee_name]
-
-    if "." not in site.callee_name:
         return None
 
-    obj_name, attr_name = site.callee_name.rsplit(".", 1)
-    obj_ns = f"{site.caller_ns}.{obj_name}"
+    def _try_class_method(self, pointee: str, method_name: str) -> str | None:
+        """If pointee is a CLASS, look up its method — walking the MRO if needed."""
+        info = self._id_to_info.get(pointee)
+        if not info or info[0] != SymbolKind.CLASS:
+            return None
 
-    # Strategy 2a: Direct AG lookup for the full object path
-    for pointee in ag.get_pointees(obj_ns):
-        resolved = _try_class_method(pointee, attr_name, id_to_info, symbol_index)
-        if resolved:
-            return resolved
-
-    # Strategy 2b: Step-by-step resolution for dotted objects (e.g., self._conn.send)
-    # Resolve each segment through the AG to handle class-level attributes
-    if "." in obj_name:
-        parts = obj_name.split(".")
-        current_ns = f"{site.caller_ns}.{parts[0]}"
-        for part in parts[1:]:
-            pointees = ag.get_pointees(current_ns)
-            resolved_next = False
-            for pointee in pointees:
-                # If pointee is a class, look up the attribute at class level
-                info = id_to_info.get(pointee)
-                if info and info[0] == SymbolKind.CLASS:
-                    current_ns = f"{pointee}.{part}"
-                    resolved_next = True
-                    break
-            if not resolved_next:
-                break
-        else:
-            # All parts resolved — now resolve the final method call
-            for pointee in ag.get_pointees(current_ns):
-                resolved = _try_class_method(pointee, attr_name, id_to_info, symbol_index)
-                if resolved:
-                    return resolved
-
-    return None
-
-
-def _try_class_method(
-    pointee: str,
-    method_name: str,
-    id_to_info: dict[str, tuple[SymbolKind, str]],
-    symbol_index: dict[str, str],
-) -> str | None:
-    """If pointee is a CLASS, look up its method in the symbol index.
-
-    Prefers the ID-based key ("{class_symbol_id}.method") which is always
-    unique, falling back to the name-based key ("ClassName.method") for
-    cases where the class was resolved by name rather than by ID.
-    """
-    info = id_to_info.get(pointee)
-    if info and info[0] == SymbolKind.CLASS:
-        # ID-based: always correct even when class names collide across files
+        # Direct lookup: method defined on this class
         id_qualified = f"{pointee}.{method_name}"
-        if id_qualified in symbol_index:
-            return symbol_index[id_qualified]
-        # Name-based fallback: works when class name is unambiguous
+        if id_qualified in self._symbol_index:
+            return self._symbol_index[id_qualified]
+
+        # Name-based fallback for unambiguous names
         name_qualified = f"{info[1]}.{method_name}"
-        if name_qualified in symbol_index:
-            return symbol_index[name_qualified]
-    return None
+        if name_qualified in self._symbol_index:
+            return self._symbol_index[name_qualified]
 
+        # MRO walk: method inherited from a parent class
+        owner_id = self._hierarchy.resolve_attribute(pointee, method_name)
+        if owner_id:
+            inherited = f"{owner_id}.{method_name}"
+            if inherited in self._symbol_index:
+                return self._symbol_index[inherited]
 
-def _find_enclosing_symbol(
-    namespace: str,
-    symbol_index: dict[str, str],
-    module_ns_index: dict[str, str],
-) -> str | None:
-    """Find the symbol ID of the function/method that contains a given namespace.
+        return None
 
-    Tries qualified names first (ClassName.method), then simple names,
-    then falls back to the module symbol.
-    """
-    parts = namespace.split(".")
+    def _classify_unresolved(self, site: _CallSite) -> CallReason:
+        """Classify an unresolved call as external or internal.
 
-    # Try qualified names from most specific to least (e.g., "Foo.bar", "Foo")
-    for i in range(len(parts) - 1, 0, -1):
-        # Try two-part qualified: "parts[i-1].parts[i]" (e.g., "ClassName.method")
-        if i + 1 < len(parts):
-            qualified = f"{parts[i]}.{parts[i + 1]}"
-            if qualified in symbol_index:
-                return symbol_index[qualified]
-        # Try single scope name (e.g., "method_name" or "ClassName")
-        if parts[i] in symbol_index:
-            return symbol_index[parts[i]]
+        For dotted calls (obj.method), checks whether the OBJECT resolves to
+        a repo class via the AG. A method name existing somewhere in the repo
+        is not sufficient — "close" exists in both repo classes and stdlib.
+        """
+        callee = site.callee_name
 
-    # Module-level call — find matching module namespace
-    for i in range(len(parts), 0, -1):
-        candidate_ns = ".".join(parts[:i])
-        if candidate_ns in module_ns_index:
-            return module_ns_index[candidate_ns]
-    return None
+        if "." not in callee:
+            return CallReason.UNRESOLVED_INTERNAL if callee in self._symbol_index else CallReason.EXTERNAL
+
+        obj_name, _ = callee.rsplit(".", 1)
+        obj_ns = f"{site.caller_ns}.{obj_name}"
+
+        for pointee in self._ag.get_pointees(obj_ns):
+            if pointee in self._id_to_info:
+                return CallReason.UNRESOLVED_INTERNAL
+
+        return CallReason.EXTERNAL
+
+    def _find_enclosing_symbol(self, namespace: str) -> str | None:
+        """Find the symbol ID of the function/method that contains a given namespace."""
+        parts = namespace.split(".")
+
+        for i in range(len(parts) - 1, 0, -1):
+            if i + 1 < len(parts):
+                qualified = f"{parts[i]}.{parts[i + 1]}"
+                if qualified in self._symbol_index:
+                    return self._symbol_index[qualified]
+            if parts[i] in self._symbol_index:
+                return self._symbol_index[parts[i]]
+
+        # Module-level call
+        for i in range(len(parts), 0, -1):
+            candidate_ns = ".".join(parts[:i])
+            if candidate_ns in self._module_ns_index:
+                return self._module_ns_index[candidate_ns]
+        return None

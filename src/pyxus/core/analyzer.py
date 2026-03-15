@@ -174,10 +174,14 @@ def _phase_heritage(indexed_files: list[SourceFile], graph: GraphStore) -> Class
                                 )
                                 break
                     class_hierarchy.add_class(cs.id, base_ids)
-                    methods = graph.successors_by_kind(cs.id, RelationKind.HAS_METHOD)
-                    for method in methods:
-                        class_hierarchy.add_attribute(cs.id, method.name)
                     break
+
+    # Register attributes for ALL classes (not just those with bases)
+    # so that resolve_attribute can find methods on base classes too
+    for sym in graph.symbols():
+        if sym.kind == SymbolKind.CLASS:
+            for method in graph.successors_by_kind(sym.id, RelationKind.HAS_METHOD):
+                class_hierarchy.add_attribute(sym.id, method.name)
 
     return class_hierarchy
 

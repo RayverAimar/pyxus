@@ -84,7 +84,8 @@ class ClassHierarchy:
 
     def add_class(self, class_id: str, base_ids: list[str]) -> None:
         """Register a class and its direct base classes."""
-        self._bases[class_id] = base_ids
+        # Filter self-references (can happen with re-export patterns like class Foo(module.Foo))
+        self._bases[class_id] = [b for b in base_ids if b != class_id]
 
     def add_attribute(self, class_id: str, attr_name: str) -> None:
         """Register an attribute (method, property) defined on a class."""
@@ -118,12 +119,19 @@ class ClassHierarchy:
         """Get the direct base class IDs for a given class."""
         return self._bases.get(class_id, [])
 
-    def _c3_linearize(self, class_id: str) -> list[str]:
+    def _c3_linearize(self, class_id: str, _visiting: set[str] | None = None) -> list[str]:
         """C3 linearization — the same algorithm Python uses for MRO."""
         if class_id not in self._bases or not self._bases[class_id]:
             return [class_id]
 
-        base_mros = [self._c3_linearize(base) for base in self._bases[class_id]]
+        # Cycle detection: a class referencing itself as a base (e.g., re-exports)
+        if _visiting is None:
+            _visiting = set()
+        if class_id in _visiting:
+            return [class_id]
+        _visiting.add(class_id)
+
+        base_mros = [self._c3_linearize(base, _visiting) for base in self._bases[class_id]]
         base_mros.append(list(self._bases[class_id]))
 
         result = [class_id]

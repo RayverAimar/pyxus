@@ -4,7 +4,7 @@ from pyxus.core.call_resolver import AssignmentGraph, CallResolutionResult, reso
 from pyxus.core.file_walker import SourceFile
 from pyxus.core.heritage import ClassHierarchy
 from pyxus.core.symbol_extractor import extract_symbols
-from pyxus.graph.models import CallReason, RelationKind
+from pyxus.graph.models import CallReason, RelationKind, SymbolKind
 from pyxus.graph.store import GraphStore
 
 
@@ -22,6 +22,8 @@ def _make_graph_from_code(code: str, path: str = "test.py") -> tuple[GraphStore,
 
 def _make_call_resolution(codes: dict[str, str]) -> CallResolutionResult:
     """Resolve calls from multiple source code strings for testing."""
+    from pyxus.core.heritage import extract_heritage
+
     graph = GraphStore()
     files = []
     for path, code in codes.items():
@@ -33,7 +35,29 @@ def _make_call_resolution(codes: dict[str, str]) -> CallResolutionResult:
         for rel in result.relationships:
             graph.add_relationship(rel)
 
+    # Build class hierarchy so inherited methods can be resolved
     hierarchy = ClassHierarchy()
+    for sf in files:
+        heritage_result = extract_heritage(sf)
+        for class_name, bases in heritage_result.class_bases.items():
+            class_syms = graph.get_symbol_by_name(class_name)
+            for cs in class_syms:
+                if cs.kind == SymbolKind.CLASS and cs.file_path == sf.path:
+                    base_ids = []
+                    for base_name in bases:
+                        for bs in graph.get_symbol_by_name(base_name.split(".")[-1]):
+                            if bs.kind == SymbolKind.CLASS:
+                                base_ids.append(bs.id)
+                                break
+                    hierarchy.add_class(cs.id, base_ids)
+                    break
+
+    # Register attributes for ALL classes (not just those with bases)
+    for sym in graph.symbols():
+        if sym.kind == SymbolKind.CLASS:
+            for method in graph.successors_by_kind(sym.id, RelationKind.HAS_METHOD):
+                hierarchy.add_attribute(sym.id, method.name)
+
     return resolve_calls(files, graph, hierarchy)
 
 
@@ -352,6 +376,67 @@ class TestReturnTypePropagation:
         targets = _extract_resolved_names(result)
         assert "get_conn" in targets
         assert "close" in targets
+
+
+class TestInheritedMethods:
+    def test_inherited_method_resolved(self):
+        """self.method() where method is defined in a parent class."""
+        code = (
+            "class Base:\n    def save(self): pass\n\nclass Child(Base):\n    def process(self):\n        self.save()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "save" in targets
+
+    def test_deep_inheritance_chain(self):
+        """Method defined two levels up in the hierarchy."""
+        code = (
+            "class A:\n"
+            "    def base_method(self): pass\n"
+            "\n"
+            "class B(A):\n"
+            "    def middle_method(self): pass\n"
+            "\n"
+            "class C(B):\n"
+            "    def leaf_method(self):\n"
+            "        self.base_method()\n"
+            "        self.middle_method()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "base_method" in targets
+        assert "middle_method" in targets
+
+    def test_method_override_resolves_to_child(self):
+        """When child overrides parent method, self.method() resolves to the child's version."""
+        code = (
+            "class Base:\n"
+            "    def run(self): pass\n"
+            "\n"
+            "class Child(Base):\n"
+            "    def run(self): pass\n"
+            "    def go(self):\n"
+            "        self.run()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "run" in targets
+
+    def test_inherited_method_on_constructed_object(self):
+        """obj = Child(); obj.parent_method() should resolve via MRO."""
+        code = (
+            "class Base:\n"
+            "    def save(self): pass\n"
+            "\n"
+            "class Child(Base):\n"
+            "    def process(self): pass\n"
+            "\n"
+            "c = Child()\n"
+            "c.save()\n"
+        )
+        result = _make_call_resolution({"test.py": code})
+        targets = _extract_resolved_names(result)
+        assert "save" in targets
 
 
 class TestEdgeCases:
