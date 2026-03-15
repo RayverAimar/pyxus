@@ -1,0 +1,183 @@
+"""Tests for core/import_resolver.py."""
+
+from pyxus.core.file_walker import SourceFile
+from pyxus.core.import_resolver import (
+    build_file_index,
+    resolve_imports,
+)
+from pyxus.graph.models import RelationKind
+
+
+def _make_source_file(path: str, content: str = "") -> SourceFile:
+    """Create a SourceFile for testing."""
+    return SourceFile(path=path, absolute_path=f"/repo/{path}", content=content)
+
+
+def _make_file_index(*paths: str) -> tuple[dict[str, str], dict[str, SourceFile]]:
+    """Create a file index and all_files dict from a list of file paths."""
+    files = [_make_source_file(p) for p in paths]
+    index = build_file_index(files)
+    all_files = {f.path: f for f in files}
+    return index, all_files
+
+
+class TestBuildFileIndex:
+    def test_simple_module(self):
+        files = [_make_source_file("utils.py")]
+        index = build_file_index(files)
+        assert index["utils"] == "utils.py"
+
+    def test_nested_module(self):
+        files = [_make_source_file("services/profiles.py")]
+        index = build_file_index(files)
+        assert index["services.profiles"] == "services/profiles.py"
+
+    def test_package_init(self):
+        files = [_make_source_file("models/__init__.py")]
+        index = build_file_index(files)
+        assert index["models"] == "models/__init__.py"
+
+    def test_deep_package(self):
+        files = [_make_source_file("api/viewsets/__init__.py"), _make_source_file("api/viewsets/profiles.py")]
+        index = build_file_index(files)
+        assert index["api.viewsets"] == "api/viewsets/__init__.py"
+        assert index["api.viewsets.profiles"] == "api/viewsets/profiles.py"
+
+
+class TestAbsoluteImports:
+    def test_import_module(self):
+        index, all_files = _make_file_index("main.py", "utils.py")
+        source = _make_source_file("main.py", "import utils\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 1
+        assert result.resolved[0].target_file == "utils.py"
+
+    def test_from_import(self):
+        index, all_files = _make_file_index("main.py", "services/profiles.py")
+        source = _make_source_file("main.py", "from services.profiles import ProfileService\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 1
+        assert result.resolved[0].target_file == "services/profiles.py"
+        assert result.resolved[0].imported_names == ["ProfileService"]
+
+    def test_from_package_import_module(self):
+        """from services import profiles → resolves to services/profiles.py."""
+        index, all_files = _make_file_index(
+            "main.py",
+            "services/__init__.py",
+            "services/profiles.py",
+        )
+        source = _make_source_file("main.py", "from services import profiles\n")
+        result = resolve_imports(source, index, all_files)
+        # Should resolve: either services/__init__.py or services/profiles.py
+        targets = {r.target_file for r in result.resolved}
+        assert "services/profiles.py" in targets or "services/__init__.py" in targets
+
+    def test_external_package_ignored(self):
+        """Imports of packages not in the repo (e.g., django) produce no resolved imports."""
+        index, all_files = _make_file_index("main.py")
+        source = _make_source_file("main.py", "import django\nfrom django.db import models\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 0
+        # External packages are not counted as unresolved — only internal failures are
+        assert len(result.unresolved) == 0
+
+
+class TestRelativeImports:
+    def test_dot_import(self):
+        """from . import models → resolves within same package."""
+        index, all_files = _make_file_index(
+            "pkg/__init__.py",
+            "pkg/main.py",
+            "pkg/models.py",
+        )
+        source = _make_source_file("pkg/main.py", "from . import models\n")
+        result = resolve_imports(source, index, all_files)
+        targets = {r.target_file for r in result.resolved}
+        assert "pkg/models.py" in targets or "pkg/__init__.py" in targets
+
+    def test_dotdot_import(self):
+        """from .. import utils → resolves to parent package."""
+        index, all_files = _make_file_index(
+            "pkg/__init__.py",
+            "pkg/sub/__init__.py",
+            "pkg/sub/deep.py",
+            "pkg/utils.py",
+        )
+        source = _make_source_file("pkg/sub/deep.py", "from .. import utils\n")
+        result = resolve_imports(source, index, all_files)
+        targets = {r.target_file for r in result.resolved}
+        assert "pkg/utils.py" in targets or "pkg/__init__.py" in targets
+
+    def test_relative_from_module(self):
+        """from .models import User → resolves within same package."""
+        index, all_files = _make_file_index(
+            "app/__init__.py",
+            "app/views.py",
+            "app/models.py",
+        )
+        source = _make_source_file("app/views.py", "from .models import User\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 1
+        assert result.resolved[0].target_file == "app/models.py"
+        assert result.resolved[0].is_relative is True
+
+
+class TestRelationships:
+    def test_creates_imports_edge(self):
+        index, all_files = _make_file_index("main.py", "utils.py")
+        source = _make_source_file("main.py", "import utils\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.relationships) == 1
+        rel = result.relationships[0]
+        assert rel.kind == RelationKind.IMPORTS
+        assert "main.py" in rel.source_id
+        assert "utils.py" in rel.target_id
+
+    def test_no_duplicate_edges(self):
+        """Multiple imports from the same file should produce only one IMPORTS edge."""
+        index, all_files = _make_file_index("main.py", "utils.py")
+        source = _make_source_file("main.py", "from utils import foo\nfrom utils import bar\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.relationships) == 1
+
+
+class TestEdgeCases:
+    def test_syntax_error_returns_empty(self):
+        index, all_files = _make_file_index("main.py")
+        source = _make_source_file("main.py", "from import\n")
+        result = resolve_imports(source, index, all_files)
+        assert result.resolved == []
+
+    def test_star_import(self):
+        """from module import * should resolve to the module file."""
+        index, all_files = _make_file_index("main.py", "types.py")
+        source = _make_source_file("main.py", "from types import *\n")
+        # "types" collides with stdlib, but our index only has repo files
+        # This tests the mechanism, not stdlib resolution
+        index["types"] = "types.py"
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 1
+
+    def test_relative_import_too_many_dots(self):
+        """from .... import x — more dots than directory depth should not crash."""
+        index, all_files = _make_file_index("pkg/mod.py")
+        source = _make_source_file("pkg/mod.py", "from .... import something\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 0
+
+    def test_multiple_names_from_one_module(self):
+        """from module import a, b, c."""
+        index, all_files = _make_file_index("main.py", "utils.py")
+        source = _make_source_file("main.py", "from utils import foo, bar, baz\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 1
+        assert set(result.resolved[0].imported_names) == {"foo", "bar", "baz"}
+
+    def test_import_from_submodule(self):
+        """from pkg.sub import func — where pkg.sub is a module file."""
+        index, all_files = _make_file_index("main.py", "pkg/__init__.py", "pkg/sub.py")
+        source = _make_source_file("main.py", "from pkg.sub import func\n")
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 1
+        assert result.resolved[0].target_file == "pkg/sub.py"

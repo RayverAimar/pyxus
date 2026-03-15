@@ -27,6 +27,3 @@ Thumbs.db
 .coverage
 htmlcov/
 .pytest_cache/
-
-# uv
-uv.lock
