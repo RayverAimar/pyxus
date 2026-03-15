@@ -10,6 +10,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+__all__ = [
+    "CallReason",
+    "RelationKind",
+    "Relationship",
+    "RiskLevel",
+    "Symbol",
+    "SymbolKind",
+    "make_relationship_id",
+    "make_symbol_id",
+]
+
 
 class SymbolKind(StrEnum):
     """Classification of Python symbols extracted from source code.
@@ -45,6 +56,22 @@ class RelationKind(StrEnum):
     CALLS = "calls"
     IMPORTS = "imports"
     EXTENDS = "extends"
+
+
+class CallReason(StrEnum):
+    """Classification of why a call could not be resolved."""
+
+    EXTERNAL = "external"
+    UNRESOLVED_INTERNAL = "unresolved_internal"
+
+
+class RiskLevel(StrEnum):
+    """Risk classification for blast radius analysis."""
+
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
 
 
 @dataclass(frozen=True)

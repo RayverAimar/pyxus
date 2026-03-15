@@ -22,8 +22,31 @@ from __future__ import annotations
 import logging
 import symtable as symtable_mod
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 logger = logging.getLogger("pyxus")
+
+__all__ = ["ScopeInfo", "ScopeTree", "ScopeType", "SymbolCategory"]
+
+
+class ScopeType(StrEnum):
+    """Type of a Python scope."""
+
+    MODULE = "module"
+    CLASS = "class"
+    FUNCTION = "function"
+
+
+class SymbolCategory(StrEnum):
+    """How a symbol is bound in its scope."""
+
+    IMPORTED = "imported"
+    PARAMETER = "parameter"
+    LOCAL = "local"
+    GLOBAL = "global"
+    FREE = "free"
+    REFERENCED = "referenced"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -38,8 +61,8 @@ class ScopeInfo:
     """
 
     name: str
-    scope_type: str
-    symbols: dict[str, str] = field(default_factory=dict)  # name → category
+    scope_type: ScopeType
+    symbols: dict[str, SymbolCategory] = field(default_factory=dict)
     children: list[ScopeInfo] = field(default_factory=list)
 
 
@@ -112,24 +135,20 @@ class ScopeTree:
         scope = self._scope_index.get(scope_name)
         if scope is None:
             return False
-        return scope.symbols.get(name) == "local"
+        return scope.symbols.get(name) == SymbolCategory.LOCAL
 
     def is_imported(self, name: str) -> bool:
         """Check if a name was brought in via an import statement."""
         return name in self._imported_names
 
-    def classify_name(self, name: str, scope_name: str) -> str:
-        """Determine how a name is bound in a given scope.
-
-        Returns one of: "local", "imported", "global", "free", "parameter", "unknown".
-        """
+    def classify_name(self, name: str, scope_name: str) -> SymbolCategory:
+        """Determine how a name is bound in a given scope."""
         scope = self._scope_index.get(scope_name)
         if scope is not None and name in scope.symbols:
             return scope.symbols[name]
-        # Check module-level scope as fallback
         if name in self._root.symbols:
             return self._root.symbols[name]
-        return "unknown"
+        return SymbolCategory.UNKNOWN
 
     @property
     def root(self) -> ScopeInfo:
@@ -137,35 +156,26 @@ class ScopeTree:
         return self._root
 
 
-def _classify_table(table: symtable_mod.SymbolTable) -> str:
-    """Map symtable table type to our scope_type string."""
+def _classify_table(table: symtable_mod.SymbolTable) -> ScopeType:
+    """Map symtable table type to ScopeType."""
     table_type = table.get_type()
     if table_type == "module":
-        return "module"
+        return ScopeType.MODULE
     if table_type == "class":
-        return "class"
-    return "function"
+        return ScopeType.CLASS
+    return ScopeType.FUNCTION
 
 
-def _classify_symbol(sym: symtable_mod.Symbol) -> str:
-    """Determine the binding category of a symbol in its scope.
-
-    Categories:
-    - "imported": brought in via import statement
-    - "parameter": function parameter
-    - "local": locally assigned variable
-    - "global": declared global
-    - "free": referenced from enclosing scope (closure variable)
-    - "referenced": used but not assigned in this scope
-    """
+def _classify_symbol(sym: symtable_mod.Symbol) -> SymbolCategory:
+    """Determine the binding category of a symbol in its scope."""
     if sym.is_imported():
-        return "imported"
+        return SymbolCategory.IMPORTED
     if sym.is_parameter():
-        return "parameter"
+        return SymbolCategory.PARAMETER
     if sym.is_local():
-        return "local"
+        return SymbolCategory.LOCAL
     if sym.is_declared_global():
-        return "global"
+        return SymbolCategory.GLOBAL
     if sym.is_free():
-        return "free"
-    return "referenced"
+        return SymbolCategory.FREE
+    return SymbolCategory.REFERENCED

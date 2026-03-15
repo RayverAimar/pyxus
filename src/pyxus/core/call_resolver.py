@@ -28,6 +28,7 @@ from pyxus.core.ast_utils import get_dotted_name
 from pyxus.core.file_walker import SourceFile
 from pyxus.core.heritage import ClassHierarchy
 from pyxus.graph.models import (
+    CallReason,
     RelationKind,
     Relationship,
     SymbolKind,
@@ -53,7 +54,7 @@ class UnresolvedCall:
     file_path: str
     line: int
     call_text: str
-    reason: str
+    reason: CallReason
 
 
 @dataclass
@@ -63,7 +64,7 @@ class ResolutionStats:
     total_calls: int = 0
     resolved: int = 0
     external: int = 0
-    unresolved_by_reason: dict[str, int] = field(default_factory=dict)
+    unresolved_by_reason: dict[CallReason, int] = field(default_factory=dict)
 
     @property
     def internal_calls(self) -> int:
@@ -582,7 +583,7 @@ def _extract_call_edges(
                 stats.resolved += 1
         else:
             reason = _classify_unresolved(site, ag, symbol_index, id_to_info)
-            if reason == "external":
+            if reason == CallReason.EXTERNAL:
                 stats.external += 1
             else:
                 unresolved.append(
@@ -603,39 +604,27 @@ def _classify_unresolved(
     ag: AssignmentGraph,
     symbol_index: dict[str, str],
     id_to_info: dict[str, tuple[SymbolKind, str]],
-) -> str:
-    """Classify an unresolved call as external or internal.
-
-    - "external": the call target is not defined in the repo (stdlib, third-party, builtins)
-    - "unresolved_internal": the target likely exists in the repo but we couldn't resolve it
-    """
+) -> CallReason:
+    """Classify an unresolved call as external or internal."""
     callee = site.callee_name
 
     if "." not in callee:
-        # Simple function call: foo()
-        # If the name exists anywhere in the repo's symbols, it's internal
-        return "unresolved_internal" if callee in symbol_index else "external"
+        return CallReason.UNRESOLVED_INTERNAL if callee in symbol_index else CallReason.EXTERNAL
 
-    # Dotted call: obj.method()
     obj_name, method_name = callee.rsplit(".", 1)
 
-    # Check if the method name exists on any class in the repo
-    # If no class in the repo defines this method, it's likely external
+    # If the method name exists on any class in the repo, it's likely internal
     qualified_match = any(key.endswith(f".{method_name}") for key in symbol_index if "." in key)
     if qualified_match:
-        # The method exists in the repo — we just couldn't resolve which class
-        return "unresolved_internal"
+        return CallReason.UNRESOLVED_INTERNAL
 
-    # Check if the object resolves to something in the AG
+    # Object resolves to a repo symbol but method not found → external method
     obj_ns = f"{site.caller_ns}.{obj_name}"
-    pointees = ag.get_pointees(obj_ns)
-    for pointee in pointees:
+    for pointee in ag.get_pointees(obj_ns):
         if pointee in id_to_info:
-            # Object resolves to a repo symbol but method not found → external method on internal object
-            return "external"
+            return CallReason.EXTERNAL
 
-    # Can't determine — the object doesn't resolve and the method name isn't in the repo
-    return "external"
+    return CallReason.EXTERNAL
 
 
 def _resolve_callee(

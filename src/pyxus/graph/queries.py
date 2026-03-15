@@ -14,8 +14,11 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from pyxus.graph.models import RelationKind, SymbolKind
+from pyxus.graph.models import RelationKind, Relationship, RiskLevel, Symbol, SymbolKind
 from pyxus.graph.store import GraphStore
+
+__all__ = ["context", "impact", "query"]
+
 
 # ── Risk assessment thresholds ────────────────────────────────────────────
 # Based on the observation that symbols with many direct dependents
@@ -209,7 +212,7 @@ def query(graph: GraphStore, search: str, limit: int = 10) -> dict[str, Any]:
 # ── Private helpers ───────────────────────────────────────────────────────
 
 
-def _disambiguation_response(matches: list) -> dict[str, Any]:
+def _disambiguation_response(matches: list[Symbol]) -> dict[str, Any]:
     """Build a disambiguation response when multiple symbols share a name."""
     return {
         "disambiguation": True,
@@ -225,7 +228,7 @@ def _disambiguation_response(matches: list) -> dict[str, Any]:
     }
 
 
-def _group_edges(edges: list[tuple]) -> dict[str, list[dict[str, Any]]]:
+def _group_edges(edges: list[tuple[Symbol, Relationship]]) -> dict[str, list[dict[str, Any]]]:
     """Group (symbol, relationship) pairs by relationship kind."""
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for sym, rel in edges:
@@ -242,12 +245,12 @@ def _group_edges(edges: list[tuple]) -> dict[str, list[dict[str, Any]]]:
     return dict(grouped)
 
 
-def _assess_risk(direct_dependents: int) -> str:
+def _assess_risk(direct_dependents: int) -> RiskLevel:
     """Map direct dependent count to a risk level."""
     if direct_dependents > _RISK_CRITICAL_THRESHOLD:
-        return "CRITICAL"
+        return RiskLevel.CRITICAL
     if direct_dependents > _RISK_HIGH_THRESHOLD:
-        return "HIGH"
+        return RiskLevel.HIGH
     if direct_dependents > _RISK_MEDIUM_THRESHOLD:
-        return "MEDIUM"
-    return "LOW"
+        return RiskLevel.MEDIUM
+    return RiskLevel.LOW

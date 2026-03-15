@@ -2,7 +2,7 @@
 
 import pytest
 
-from pyxus.graph.models import RelationKind, Relationship, Symbol, SymbolKind
+from pyxus.graph.models import RelationKind, Relationship, RiskLevel, Symbol, SymbolKind
 from pyxus.graph.queries import context, impact, query
 from pyxus.graph.store import GraphStore
 
@@ -151,7 +151,7 @@ class TestImpact:
 
     def test_risk_levels(self, graph_with_service):
         result = impact(graph_with_service, "helper", direction="upstream")
-        assert result["risk"] in ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+        assert result["risk"] in (RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL)
 
     def test_summary_counts(self, graph_with_service):
         result = impact(graph_with_service, "helper", direction="upstream")
@@ -271,7 +271,7 @@ class TestRiskThresholds:
                 )
             )
         result = impact(g, "Target", direction="upstream")
-        assert result["risk"] == "CRITICAL"
+        assert result["risk"] == RiskLevel.CRITICAL
 
     def test_high_risk(self):
         """6-10 direct dependents should be HIGH."""
@@ -304,7 +304,7 @@ class TestRiskThresholds:
                 )
             )
         result = impact(g, "Target", direction="upstream")
-        assert result["risk"] == "HIGH"
+        assert result["risk"] == RiskLevel.HIGH
 
     def test_medium_risk(self):
         """3-5 direct dependents should be MEDIUM."""
@@ -337,4 +337,4 @@ class TestRiskThresholds:
                 )
             )
         result = impact(g, "Target", direction="upstream")
-        assert result["risk"] == "MEDIUM"
+        assert result["risk"] == RiskLevel.MEDIUM

@@ -4,7 +4,7 @@ from pyxus.core.call_resolver import AssignmentGraph, CallResolutionResult, reso
 from pyxus.core.file_walker import SourceFile
 from pyxus.core.heritage import ClassHierarchy
 from pyxus.core.symbol_extractor import extract_symbols
-from pyxus.graph.models import RelationKind
+from pyxus.graph.models import CallReason, RelationKind
 from pyxus.graph.store import GraphStore
 
 
@@ -214,7 +214,7 @@ class TestCoverageStats:
         )
         result = _make_call_resolution({"test.py": code})
         assert len(result.unresolved) >= 1
-        assert result.unresolved[0].reason == "unresolved_internal"
+        assert result.unresolved[0].reason == CallReason.UNRESOLVED_INTERNAL
 
 
 class TestReturnTypePropagation:

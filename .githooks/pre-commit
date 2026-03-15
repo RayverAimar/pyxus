@@ -1,0 +1,33 @@
+#!/bin/sh
+# Pre-commit hook: lint, format check, and fast tests
+# Prevents committing code that doesn't pass quality checks
+
+set -e
+
+echo "Running pre-commit checks..."
+
+# 1. Lint check
+echo "  ruff check..."
+uv run ruff check .
+if [ $? -ne 0 ]; then
+    echo "FAILED: ruff check found issues. Fix them before committing."
+    exit 1
+fi
+
+# 2. Format check (don't auto-format, just verify)
+echo "  ruff format --check..."
+uv run ruff format --check .
+if [ $? -ne 0 ]; then
+    echo "FAILED: Code is not formatted. Run 'uv run ruff format .' first."
+    exit 1
+fi
+
+# 3. Run tests (fast, no coverage to keep it quick)
+echo "  pytest..."
+uv run pytest -x -q --no-header --tb=short 2>&1
+if [ $? -ne 0 ]; then
+    echo "FAILED: Tests failed. Fix them before committing."
+    exit 1
+fi
+
+echo "All pre-commit checks passed."
