@@ -18,7 +18,7 @@ Give your AI agents a complete understanding of any Python codebase — in secon
 
 Pyxus builds a **knowledge graph** of your Python codebase — every class, function, method call, import, and inheritance chain — and exposes it to AI agents via [MCP](https://modelcontextprotocol.io/). Your LLM stops guessing and starts *knowing* how the code connects.
 
-**100 files in ~1.2s** | **70-85% call resolution without type hints** | **279 tests**
+**100 files in ~1.2s** | **70-85% call resolution without type hints** | **317 tests**
 
 ## The Problem
 
@@ -48,6 +48,7 @@ Agent → context("UserService")
 ```bash
 git clone https://github.com/RayverAimar/pyxus.git
 cd pyxus && uv sync
+uv sync --extra ui    # Optional: enables `pyxus ui`
 ```
 
 ## MCP Tools
@@ -78,6 +79,7 @@ pyxus imports <path>    # Fast: import dependencies + circular detection
 pyxus status <path>     # Index metadata
 pyxus clean <path>      # Delete .pyxus/ index
 pyxus serve             # Start MCP server
+pyxus ui [path]         # Launch interactive web UI
 ```
 
 ## Import Analysis
@@ -97,6 +99,20 @@ pyxus imports /path/to/project
 ```
 
 Know which modules are tightly coupled, which are isolated, and where the dependency cycles live — before your agent touches a single line.
+
+## Web UI
+
+An interactive graph visualization for exploring your codebase visually:
+
+```bash
+pyxus ui /path/to/project         # Opens browser at localhost:8420
+pyxus ui --port 9000              # Custom port
+pyxus ui --dev                    # API only (for frontend development)
+```
+
+Search symbols, inspect dependencies, trace impact paths, and spot circular imports — all from the browser. Built with React, Sigma.js, and Tailwind CSS.
+
+Requires the `ui` extra: `uv sync --extra ui`
 
 ## What It Resolves
 
