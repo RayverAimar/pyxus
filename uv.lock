@@ -1092,6 +1092,9 @@ intelligence = [
     { name = "leidenalg" },
     { name = "python-igraph" },
 ]
+ui = [
+    { name = "uvicorn" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1107,8 +1110,9 @@ requires-dist = [
     { name = "leidenalg", marker = "extra == 'intelligence'", specifier = ">=0.10" },
     { name = "python-igraph", marker = "extra == 'intelligence'", specifier = ">=0.11" },
     { name = "rustworkx", specifier = ">=0.15" },
+    { name = "uvicorn", marker = "extra == 'ui'", specifier = ">=0.30" },
 ]
-provides-extras = ["intelligence"]
+provides-extras = ["intelligence", "ui"]
 
 [package.metadata.requires-dev]
 dev = [
