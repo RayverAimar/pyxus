@@ -27,3 +27,10 @@ Thumbs.db
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Node / Frontend
+node_modules/
+*.tsbuildinfo
+
+# Local config
+.mcp.json
