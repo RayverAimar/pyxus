@@ -1,13 +1,14 @@
 """Command-line interface for Pyxus.
 
 Provides commands to analyze Python codebases, check index status,
-manage the .pyxus directory, and start the MCP server.
+manage the .pyxus directory, start the MCP server, and launch the web UI.
 
 Usage:
     pyxus analyze [PATH]     Analyze a Python codebase and build the knowledge graph
     pyxus status             Show index status without loading the graph
     pyxus clean              Delete the .pyxus/ directory
     pyxus serve              Start the MCP server (stdio transport)
+    pyxus ui                 Launch the web UI for interactive graph exploration
 """
 
 from __future__ import annotations
@@ -157,3 +158,49 @@ def serve() -> None:
     from pyxus.server import mcp
 
     mcp.run()
+
+
+@main.command()
+@click.argument("path", default=".", type=click.Path(exists=True))
+@click.option("--port", default=8420, help="Port for the web server.")
+@click.option("--no-open", is_flag=True, help="Don't open the browser automatically.")
+@click.option("--dev", is_flag=True, help="Dev mode: serve only API, no static files.")
+def ui(path: str, port: int, no_open: bool, dev: bool) -> None:
+    """Launch the web UI for interactive graph exploration."""
+    import webbrowser
+
+    logging.basicConfig(level=logging.INFO, format="  %(message)s")
+
+    # Deferred: avoids importing heavy deps on CLI startup
+    from pyxus.graph.persistence import get_index_metadata, load_graph
+    from pyxus.web.app import create_app
+
+    repo_path = str(Path(path).resolve())
+
+    graph = load_graph(repo_path)
+    if graph is None:
+        click.echo("No Pyxus index found. Run `pyxus analyze` first.")
+        raise SystemExit(1)
+
+    metadata = get_index_metadata(repo_path)
+    click.echo(f"Pyxus v{__version__} — Web UI")
+    click.echo(f"  Graph: {graph.node_count} symbols, {graph.edge_count} edges")
+
+    app = create_app(graph, metadata=metadata, dev=dev)
+
+    url = f"http://localhost:{port}"
+    if dev:
+        click.echo(f"  Dev mode: API only at {url}/api/")
+    else:
+        click.echo(f"  Open {url} in your browser")
+
+    if not no_open and not dev:
+        webbrowser.open(url)
+
+    try:
+        import uvicorn
+    except ImportError:
+        click.echo("  uvicorn is required for the web UI. Install with: uv sync --extra ui")
+        raise SystemExit(1) from None
+
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
