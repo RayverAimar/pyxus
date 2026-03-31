@@ -78,6 +78,10 @@ def build_file_index(files: list[SourceFile]) -> dict[str, str]:
     Creates entries for both direct modules and __init__.py packages,
     enabling resolution of imports like ``from wallet_screener.models import X``.
 
+    Handles ``src/`` layout projects by also registering paths without the
+    ``src.`` prefix (e.g. ``src/pyxus/core/analyzer.py`` is indexed as both
+    ``src.pyxus.core.analyzer`` and ``pyxus.core.analyzer``).
+
     Example entries:
         "wallet_screener.models" → "wallet_screener/models/__init__.py"
         "wallet_screener.models.profiles" → "wallet_screener/models/profiles.py"
@@ -98,6 +102,12 @@ def build_file_index(files: list[SourceFile]) -> dict[str, str]:
             parts[-1] = parts[-1].removesuffix(".py")
             module_path = ".".join(parts)
             index[module_path] = f.path
+
+        # src-layout support: register without "src." prefix so absolute
+        # imports like ``from pyxus.core import X`` resolve correctly.
+        if module_path.startswith("src."):
+            index[module_path[4:]] = f.path
+
     return index
 
 

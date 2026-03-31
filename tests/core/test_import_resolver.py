@@ -183,6 +183,89 @@ class TestEdgeCases:
         assert result.resolved[0].target_file == "pkg/sub.py"
 
 
+class TestSrcLayout:
+    """Tests for src/ layout projects where file paths start with src/."""
+
+    def test_file_index_registers_without_src_prefix(self):
+        """src/pkg/module.py should be indexed as both src.pkg.module and pkg.module."""
+        files = [_make_source_file("src/mylib/core/engine.py")]
+        index = build_file_index(files)
+        assert index["src.mylib.core.engine"] == "src/mylib/core/engine.py"
+        assert index["mylib.core.engine"] == "src/mylib/core/engine.py"
+
+    def test_file_index_src_package_init(self):
+        """src/pkg/__init__.py should be indexed as both src.pkg and pkg."""
+        files = [_make_source_file("src/mylib/__init__.py")]
+        index = build_file_index(files)
+        assert index["src.mylib"] == "src/mylib/__init__.py"
+        assert index["mylib"] == "src/mylib/__init__.py"
+
+    def test_file_index_src_deep_package(self):
+        """src/pkg/sub/__init__.py should be indexed without src prefix."""
+        files = [_make_source_file("src/mylib/core/__init__.py")]
+        index = build_file_index(files)
+        assert index["mylib.core"] == "src/mylib/core/__init__.py"
+
+    def test_absolute_import_resolves_in_src_layout(self):
+        """Absolute imports should resolve when files live under src/."""
+        index, all_files = _make_file_index(
+            "src/mylib/__init__.py",
+            "src/mylib/core/__init__.py",
+            "src/mylib/core/engine.py",
+            "src/mylib/cli.py",
+        )
+        source = _make_source_file(
+            "src/mylib/cli.py",
+            "from mylib.core.engine import run\n",
+        )
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 1
+        assert result.resolved[0].target_file == "src/mylib/core/engine.py"
+
+    def test_import_creates_edge_in_src_layout(self):
+        """IMPORTS edge should be created for src-layout absolute imports."""
+        index, all_files = _make_file_index(
+            "src/myapp/__init__.py",
+            "src/myapp/models.py",
+            "src/myapp/views.py",
+        )
+        source = _make_source_file(
+            "src/myapp/views.py",
+            "from myapp.models import User\n",
+        )
+        result = resolve_imports(source, index, all_files)
+        assert len(result.relationships) == 1
+        rel = result.relationships[0]
+        assert rel.kind == RelationKind.IMPORTS
+        assert "views.py" in rel.source_id
+        assert "models.py" in rel.target_id
+
+    def test_multiple_src_imports_resolve(self):
+        """Multiple absolute imports should each resolve in src/ layout."""
+        index, all_files = _make_file_index(
+            "src/pkg/__init__.py",
+            "src/pkg/core/__init__.py",
+            "src/pkg/core/store.py",
+            "src/pkg/core/models.py",
+            "src/pkg/server.py",
+        )
+        source = _make_source_file(
+            "src/pkg/server.py",
+            "from pkg.core.store import GraphStore\nfrom pkg.core.models import Symbol\n",
+        )
+        result = resolve_imports(source, index, all_files)
+        assert len(result.resolved) == 2
+        targets = {r.target_file for r in result.resolved}
+        assert targets == {"src/pkg/core/store.py", "src/pkg/core/models.py"}
+
+    def test_non_src_files_unaffected(self):
+        """Files not under src/ should not gain spurious index entries."""
+        files = [_make_source_file("tests/test_foo.py")]
+        index = build_file_index(files)
+        assert "tests.test_foo" in index
+        assert "test_foo" not in index  # should NOT strip "tests."
+
+
 class TestImportLocations:
     def test_top_level_import(self):
         """Top-level imports are tagged as scope=top_level."""
