@@ -12,6 +12,8 @@ Give your AI agents a complete understanding of any Python codebase — in secon
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://docs.astral.sh/ruff/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
+<img src="docs/graph-explorer.png" alt="Pyxus interactive graph explorer — modules, classes, functions and call edges" width="900"/>
+
 </div>
 
 ---
